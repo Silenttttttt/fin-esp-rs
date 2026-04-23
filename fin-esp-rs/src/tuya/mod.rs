@@ -82,6 +82,12 @@ impl TuyaLamp {
         self.send_dps(r#""20":true,"21":"white","22":1000,"23":1000"#).map(|_| true)
     }
 
+    /// Set brightness only (DPS 22: 10–1000). Does not change color or mode.
+    pub fn set_brightness(&self, level: u16) -> bool {
+        let dps = std::format!(r#""22":{}"#, level.clamp(10, 1000));
+        self.send_dps(&dps).is_some()
+    }
+
     fn send_dps(&self, dps_inner: &str) -> Option<()> {
         match session::Session::connect(self.ip, self.port, &self.key, self.version) {
             Ok(mut sess) => {
@@ -163,6 +169,11 @@ impl LampHandle {
         *self.target.lock().unwrap() = 3;
         self.retry_after_ms.store(0, Ordering::Relaxed);
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+    }
+
+    /// Set brightness directly (bypasses the target queue). Returns true on success.
+    pub fn apply_brightness(&self, level: u16) -> bool {
+        self.lamp.set_brightness(level)
     }
 
     /// Called from the lamp bridge thread. Executes any pending target command.

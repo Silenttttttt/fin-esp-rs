@@ -26,7 +26,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -107,6 +107,11 @@ fn main() {
     let mut vol_pin = AdcChannelDriver::new(
         &adc,
         peripherals.pins.gpio34,
+        &AdcChannelConfig { attenuation: attenuation::DB_11, ..Default::default() },
+    ).unwrap();
+    let mut light_pin = AdcChannelDriver::new(
+        &adc,
+        peripherals.pins.gpio35,
         &AdcChannelConfig { attenuation: attenuation::DB_11, ..Default::default() },
     ).unwrap();
     led_green.set_low().unwrap();
@@ -335,8 +340,22 @@ fn main() {
         .stack_size(16384)
         .spawn(move || {
             let mut last_refresh_ms: u64 = 0;
+            let mut last_bright_sent: u16 = u16::MAX; // MAX = waiting for first ADC read
             loop {
                 let toggled = lamp_bridge.poll();
+
+                // Brightness pot: pickup mode — adopt initial position without sending,
+                // then only send on actual movement.
+                let bright = LIGHT_BRIGHTNESS.load(Ordering::Relaxed);
+                if bright > 0 {
+                    if last_bright_sent == u16::MAX {
+                        last_bright_sent = bright; // don't override lamp on startup
+                    } else if bright != last_bright_sent {
+                        if lamp_bridge.apply_brightness(bright) {
+                            last_bright_sent = bright;
+                        }
+                    }
+                }
 
                 let now = millis();
                 let do_refresh = now - last_refresh_ms >= 5_000;
@@ -400,7 +419,9 @@ fn main() {
     let mut last_btn_debug_ms:      u64 = 0; // first log fires immediately
 
     let mut last_vol_read_ms: u64 = 0;
-    let mut vol_smoothed: u32 = u32::MAX; // fixed-point raw*16; MAX = uninitialized
+    let mut vol_smoothed: u32 = u32::MAX;
+    let mut last_light_read_ms: u64 = 0;
+    let mut light_smoothed: u32 = u32::MAX;
 
     let mut last_btn_screen = true;
     let mut last_btn_light  = true;
@@ -654,14 +675,40 @@ fn main() {
             // EMA alpha=0.25 in fixed-point (*16): smoothed = (smoothed*3 + raw*16) / 4
             let fp = raw * 16;
             if vol_smoothed == u32::MAX { vol_smoothed = fp; }
-            // alpha=0.5: one-step lag (~10ms), enough to kill ADC noise
-            vol_smoothed = (vol_smoothed + fp) / 2;
+            // Adaptive alpha: 0.35 at rest (kills noise), 1.0 when moving fast (no lag).
+            // Smooth transition so there's no hard snap threshold causing jumps.
+            let error = fp.abs_diff(vol_smoothed);
+            let alpha: u32 = if error <= 400 {
+                90  // ~0.35 × 256 — heavy smoothing
+            } else if error >= 3200 {
+                256 // 1.0 — instant track
+            } else {
+                90 + (error - 400) * 166 / 2800 // linear interp
+            };
+            vol_smoothed = (vol_smoothed * (256 - alpha) + fp * alpha) / 256;
             // sqrt curve: concentrates resolution at high pot positions
             let x = vol_smoothed as f32 / (4095.0 * 16.0);
             let vol = (x.sqrt() * 153.0) as u8;
             let prev = VOLUME_PCT.load(Ordering::Relaxed);
             if prev == 255 || (vol as i16 - prev as i16).abs() >= 2 {
                 VOLUME_PCT.store(vol, Ordering::Relaxed);
+            }
+        }
+
+        // ── Light potentiometer (GPIO 35, ADC1) ──────────────────────────────
+        if now - last_light_read_ms >= 10 {
+            last_light_read_ms = now;
+            let raw = light_pin.read_raw().unwrap_or(0) as u32;
+            let fp = raw * 16;
+            if light_smoothed == u32::MAX { light_smoothed = fp; }
+            let error = fp.abs_diff(light_smoothed);
+            let alpha: u32 = if error <= 400 { 90 } else if error >= 3200 { 256 }
+                             else { 90 + (error - 400) * 166 / 2800 };
+            light_smoothed = (light_smoothed * (256 - alpha) + fp * alpha) / 256;
+            let brightness = (10 + light_smoothed * 990 / (4095 * 16)) as u16;
+            let prev = LIGHT_BRIGHTNESS.load(Ordering::Relaxed);
+            if prev == 0 || (brightness as i32 - prev as i32).abs() >= 5 {
+                LIGHT_BRIGHTNESS.store(brightness, Ordering::Relaxed);
             }
         }
 
@@ -731,6 +778,7 @@ fn main() {
 
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
+static LIGHT_BRIGHTNESS: AtomicU16 = AtomicU16::new(0); // 0 = not yet read
 
 fn spawn_media_server() {
     std::thread::Builder::new()
