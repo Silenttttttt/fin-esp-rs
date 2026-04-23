@@ -13,6 +13,9 @@ mod screen;
 mod ticker;
 mod tuya;
 
+use esp_idf_hal::adc::attenuation;
+use esp_idf_hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
+use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{PinDriver, Pull};
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
@@ -23,7 +26,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -99,6 +102,13 @@ fn main() {
     let btn_media   = PinDriver::input(peripherals.pins.gpio19, Pull::Up).unwrap();
     let mut led_green = esp_idf_hal::gpio::PinDriver::output(peripherals.pins.gpio25).unwrap();
     let mut led_red   = esp_idf_hal::gpio::PinDriver::output(peripherals.pins.gpio33).unwrap();
+
+    let adc = AdcDriver::new(peripherals.adc1).unwrap();
+    let mut vol_pin = AdcChannelDriver::new(
+        &adc,
+        peripherals.pins.gpio34,
+        &AdcChannelConfig { attenuation: attenuation::DB_11, ..Default::default() },
+    ).unwrap();
     led_green.set_low().unwrap();
     led_red.set_high().unwrap(); // red on until WiFi connects
 
@@ -389,6 +399,9 @@ fn main() {
     let mut wifi_down_since_ms:     u64 = 0; // 0 = currently connected
     let mut last_btn_debug_ms:      u64 = 0; // first log fires immediately
 
+    let mut last_vol_read_ms: u64 = 0;
+    let mut vol_smoothed: u32 = u32::MAX; // fixed-point raw*16; MAX = uninitialized
+
     let mut last_btn_screen = true;
     let mut last_btn_light  = true;
     let mut last_btn_warm   = true;
@@ -634,6 +647,24 @@ fn main() {
             ticker::render(&mut lcd, &mut row_cache, &st, now);
         }
 
+        // ── Volume potentiometer (GPIO 34, ADC1) ─────────────────────────────
+        if now - last_vol_read_ms >= 10 {
+            last_vol_read_ms = now;
+            let raw = vol_pin.read_raw().unwrap_or(0) as u32;
+            // EMA alpha=0.25 in fixed-point (*16): smoothed = (smoothed*3 + raw*16) / 4
+            let fp = raw * 16;
+            if vol_smoothed == u32::MAX { vol_smoothed = fp; }
+            // alpha=0.5: one-step lag (~10ms), enough to kill ADC noise
+            vol_smoothed = (vol_smoothed + fp) / 2;
+            // sqrt curve: concentrates resolution at high pot positions
+            let x = vol_smoothed as f32 / (4095.0 * 16.0);
+            let vol = (x.sqrt() * 153.0) as u8;
+            let prev = VOLUME_PCT.load(Ordering::Relaxed);
+            if prev == 255 || (vol as i16 - prev as i16).abs() >= 2 {
+                VOLUME_PCT.store(vol, Ordering::Relaxed);
+            }
+        }
+
         // ── Backlight + WiFi LEDs — single source of truth ───────────────────
         // Both are driven here every loop iteration. Nothing else sets LEDs.
         let is_day = {
@@ -699,6 +730,7 @@ fn main() {
 }
 
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
+static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
 
 fn spawn_media_server() {
     std::thread::Builder::new()
@@ -716,12 +748,22 @@ fn spawn_media_server() {
                 match stream {
                     Ok(mut s) => {
                         info!("[media-srv] laptop connected");
+                        // Treat current pot position as already-sent so we don't
+                        // override the laptop's volume on connect — only actual
+                        // pot movement triggers an update.
+                        let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
                         loop {
                             if PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
                                 if s.write_all(b"p\n").is_err() { break; }
-                                info!("[media-srv] signal sent");
+                                info!("[media-srv] play/pause sent");
                             }
-                            FreeRtos::delay_ms(50);
+                            let vol = VOLUME_PCT.load(Ordering::Relaxed);
+                            if vol != 255 && vol != last_vol {
+                                let msg = std::format!("v:{}\n", vol);
+                                if s.write_all(msg.as_bytes()).is_err() { break; }
+                                last_vol = vol;
+                            }
+                            FreeRtos::delay_ms(10);
                         }
                         info!("[media-srv] laptop disconnected");
                     }

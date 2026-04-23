@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Connects to the ESP32's media server on port 9876.
-Runs `playerctl play-pause` whenever it receives "p\n".
+  p   → playerctl play-pause
+  v:N → pactl set-sink-volume @DEFAULT_SINK@ N%
 Auto-reconnects if the ESP32 reboots or WiFi drops.
 """
 import os
@@ -11,8 +12,21 @@ import logging
 import sys
 import time
 
-ESP_IP   = os.environ.get('ESP_IP', '192.168.1.x')  # set ESP_IP env var or edit here
+ESP_IP   = os.environ.get('ESP_IP', '192.168.1.x')
 ESP_PORT = 9876
+
+def handle(line: str):
+    line = line.strip()
+    if line == 'p':
+        logging.info('play-pause')
+        subprocess.run(['playerctl', 'play-pause'], capture_output=True)
+    elif line.startswith('v:'):
+        vol = line[2:]
+        logging.info('volume → %s%%', vol)
+        subprocess.run(
+            ['pactl', 'set-sink-volume', '@DEFAULT_SINK@', f'{vol}%'],
+            capture_output=True,
+        )
 
 if __name__ == '__main__':
     logging.basicConfig(
@@ -25,24 +39,20 @@ if __name__ == '__main__':
             logging.info('connecting to ESP32 %s:%d ...', ESP_IP, ESP_PORT)
             with socket.create_connection((ESP_IP, ESP_PORT), timeout=10) as s:
                 logging.info('connected')
-                # TCP keepalive — detects a rebooted ESP32 within ~30s
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-                s.settimeout(None)  # block forever — keepalive handles dead connections
+                s.settimeout(None)
+                buf = b''
                 while True:
-                    data = s.recv(16)
-                    if not data:
+                    chunk = s.recv(64)
+                    if not chunk:
                         break
-                    if b'p' in data:
-                        logging.info('play-pause!')
-                        result = subprocess.run(
-                            ['playerctl', 'play-pause'],
-                            capture_output=True, text=True
-                        )
-                        if result.returncode != 0:
-                            logging.warning('playerctl: %s', result.stderr.strip())
+                    buf += chunk
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        handle(line.decode('ascii', errors='ignore'))
         except Exception as e:
             logging.warning('disconnected: %s — retrying in 3s', e)
             time.sleep(3)
