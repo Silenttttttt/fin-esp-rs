@@ -1,0 +1,14 @@
+[Unit]
+Description=ESP32 play/pause bridge
+After=network.target
+
+[Service]
+EnvironmentFile=-%h/.config/fin-esp/env
+ExecStart=/usr/bin/python3 %h/fin-esp-rs/laptop/play_pause_server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

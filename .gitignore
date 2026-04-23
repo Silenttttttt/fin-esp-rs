@@ -1,0 +1,6 @@
+.env
+fin-esp-rs/target/
+fin-esp-rs/.embuild/
+fin-esp-rs/*.bin
+__pycache__/
+*.pyc

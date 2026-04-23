@@ -1,0 +1,28 @@
+[package]
+name = "fin-esp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-idf-svc = { version = "0.52", features = ["critical-section"] }
+esp-idf-hal = "0.46"
+esp-idf-sys = { version = "0.37", features = ["binstart"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+cipher = "0.4"
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+
+[profile.dev]
+debug = true
+opt-level = "z"

@@ -1,0 +1,51 @@
+# Rust requires a larger main task stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+
+# Custom partition table (large app, no OTA)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/home/silent/Documents/Computarias/Fin-ESP/fin-esp-rs/partitions.csv"
+
+# Flash size 4MB
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# WiFi
+CONFIG_ESP_WIFI_SSID="Tigrado_2.4"
+CONFIG_ESP_WIFI_PASSWORD="11223344"
+
+# Flash mode DIO (required for this board)
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# Disable watchdog on idle tasks to avoid false triggers during network I/O
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Disable brownout detector entirely.
+# The WiFi radio frontend draws transient current spikes — during PHY init
+# AND during peak TX load (parallel HTTPS fetches) — that dip the supply
+# below any usable detection threshold on this board.  The detector caused
+# an infinite reset loop at every level including the minimum (2.43 V).
+# NVS-backed cache handles data persistence across power cycles, so there
+# is no state worth protecting via brownout detection.
+CONFIG_ESP_BROWNOUT_DET=n
+
+# HTTPS / TLS
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+
+# Shrink mbedTLS record buffers — all API responses are < 2 KB JSON.
+# Default RX=16 KB costs ~30 KB heap per TLS session; 4 KB RX + 2 KB TX
+# cuts that to ~10 KB, so 5 parallel sessions cost ~50 KB instead of ~150 KB.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+
+# NTP
+CONFIG_LWIP_SNTP_MAX_SERVERS=1
+
+# Stack overflow detection — canary check on every task switch
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
