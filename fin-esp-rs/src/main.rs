@@ -489,6 +489,7 @@ fn main() {
             if now - last_debounce_screen_ms >= config::DEBOUNCE_MS {
                 last_debounce_screen_ms = now;
                 last_auto_screen_ms     = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 chart_active = false; // pressing screen button exits chart mode
                 info!("[btn] screen button pressed");
                 if let Ok(mut st) = ui_state.lock() { st.screen = st.screen.next(); }
@@ -505,6 +506,7 @@ fn main() {
         if last_btn_light && !light {
             if now - last_debounce_light_ms >= config::DEBOUNCE_MS {
                 last_debounce_light_ms = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 info!("[btn] light button pressed");
                 let (new_on, wifi_conn) = {
                     let st = ui_state.lock().unwrap();
@@ -532,6 +534,7 @@ fn main() {
         if last_btn_display && !disp_btn {
             if now - last_debounce_display_ms >= config::DEBOUNCE_MS {
                 last_debounce_display_ms = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 screen_forced_off = !screen_forced_off;
                 save_screen_forced(&nvs_cache, screen_forced_off);
                 info!("[btn] display: {}", if screen_forced_off { "off" } else { "on" });
@@ -544,6 +547,7 @@ fn main() {
         if last_btn_warm && !warm_btn {
             if now - last_debounce_warm_ms >= config::DEBOUNCE_MS {
                 last_debounce_warm_ms = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 info!("[btn] warm dim");
                 lamp_handle.queue_warm_dim();
                 if screen_forced_off { screen_forced_off = false; save_screen_forced(&nvs_cache, false); }
@@ -566,6 +570,7 @@ fn main() {
         if last_btn_bright && !bright_btn {
             if now - last_debounce_bright_ms >= config::DEBOUNCE_MS {
                 last_debounce_bright_ms = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 info!("[btn] bright white");
                 lamp_handle.queue_bright_white();
                 if screen_forced_off { screen_forced_off = false; save_screen_forced(&nvs_cache, false); }
@@ -588,6 +593,7 @@ fn main() {
         if last_btn_chart && !chart_btn {
             if now - last_debounce_chart_ms >= config::DEBOUNCE_MS {
                 last_debounce_chart_ms = now;
+                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 if chart_active {
                     chart_active = false;
                     row_cache.invalidate();
