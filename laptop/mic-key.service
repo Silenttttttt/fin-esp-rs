@@ -1,0 +1,14 @@
+[Unit]
+Description=Evdev key daemon (mic toggle, play/pause)
+After=graphical-session.target
+
+[Service]
+EnvironmentFile=-%h/.config/fin-esp/env
+ExecStart=/usr/bin/python3 %h/fin-esp-rs/laptop/mic_key_daemon.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

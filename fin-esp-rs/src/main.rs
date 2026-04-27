@@ -26,7 +26,8 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::io::BufRead;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -102,6 +103,7 @@ fn main() {
     let btn_media   = PinDriver::input(peripherals.pins.gpio19, Pull::Up).unwrap();
     let mut led_green = esp_idf_hal::gpio::PinDriver::output(peripherals.pins.gpio25).unwrap();
     let mut led_red   = esp_idf_hal::gpio::PinDriver::output(peripherals.pins.gpio33).unwrap();
+    let mut led_blue  = esp_idf_hal::gpio::PinDriver::output(peripherals.pins.gpio5).unwrap();
 
     let adc = AdcDriver::new(peripherals.adc1).unwrap();
     let mut vol_pin = AdcChannelDriver::new(
@@ -109,13 +111,9 @@ fn main() {
         peripherals.pins.gpio34,
         &AdcChannelConfig { attenuation: attenuation::DB_11, ..Default::default() },
     ).unwrap();
-    let mut light_pin = AdcChannelDriver::new(
-        &adc,
-        peripherals.pins.gpio35,
-        &AdcChannelConfig { attenuation: attenuation::DB_11, ..Default::default() },
-    ).unwrap();
     led_green.set_low().unwrap();
     led_red.set_high().unwrap(); // red on until WiFi connects
+    led_blue.set_low().unwrap();
 
     // ── Particle loading screen: full-screen sand/water on all 4 rows ──────────
     // Clear all 8 CGRAM slots — LCD CGRAM persists across soft resets (OTA), so
@@ -272,6 +270,8 @@ fn main() {
 
     // Media server — laptop connects here and receives "p\n" on button press.
     spawn_media_server();
+    // Mic LED server — any machine connects briefly to send "m:0\n" or "m:1\n".
+    spawn_mic_server();
 
     // Shared state
     let ui_state   = Arc::new(Mutex::new(screen::UiState::default()));
@@ -340,22 +340,8 @@ fn main() {
         .stack_size(16384)
         .spawn(move || {
             let mut last_refresh_ms: u64 = 0;
-            let mut last_bright_sent: u16 = u16::MAX; // MAX = waiting for first ADC read
             loop {
                 let toggled = lamp_bridge.poll();
-
-                // Brightness pot: pickup mode — adopt initial position without sending,
-                // then only send on actual movement.
-                let bright = LIGHT_BRIGHTNESS.load(Ordering::Relaxed);
-                if bright > 0 {
-                    if last_bright_sent == u16::MAX {
-                        last_bright_sent = bright; // don't override lamp on startup
-                    } else if bright != last_bright_sent {
-                        if lamp_bridge.apply_brightness(bright) {
-                            last_bright_sent = bright;
-                        }
-                    }
-                }
 
                 let now = millis();
                 let do_refresh = now - last_refresh_ms >= 5_000;
@@ -372,7 +358,7 @@ fn main() {
                     }
                 }
 
-                std::thread::sleep(Duration::from_millis(40));
+                std::thread::sleep(Duration::from_millis(20));
             }
         })
         .unwrap();
@@ -420,8 +406,6 @@ fn main() {
 
     let mut last_vol_read_ms: u64 = 0;
     let mut vol_smoothed: u32 = u32::MAX;
-    let mut last_light_read_ms: u64 = 0;
-    let mut light_smoothed: u32 = u32::MAX;
 
     let mut last_btn_screen = true;
     let mut last_btn_light  = true;
@@ -671,44 +655,40 @@ fn main() {
         // ── Volume potentiometer (GPIO 34, ADC1) ─────────────────────────────
         if now - last_vol_read_ms >= 10 {
             last_vol_read_ms = now;
-            let raw = vol_pin.read_raw().unwrap_or(0) as u32;
-            // EMA alpha=0.25 in fixed-point (*16): smoothed = (smoothed*3 + raw*16) / 4
-            let fp = raw * 16;
-            if vol_smoothed == u32::MAX { vol_smoothed = fp; }
-            // Adaptive alpha: 0.35 at rest (kills noise), 1.0 when moving fast (no lag).
-            // Smooth transition so there's no hard snap threshold causing jumps.
-            let error = fp.abs_diff(vol_smoothed);
-            let alpha: u32 = if error <= 400 {
-                90  // ~0.35 × 256 — heavy smoothing
-            } else if error >= 3200 {
-                256 // 1.0 — instant track
+            // Median of 5 rapid samples: rejects single-sample spikes and cuts
+            // gaussian noise variance by ~2.2× before anything else touches it.
+            let mut s = [0u32; 5];
+            for v in s.iter_mut() { *v = vol_pin.read_raw().unwrap_or(0) as u32; }
+            s.sort_unstable();
+            let raw = s[2];
+            // Apply sqrt curve in vol×256 fixed-point. Tiny dead zone avoids singularity.
+            let raw_fp: u32 = if raw < 30 {
+                0
             } else {
-                90 + (error - 400) * 166 / 2800 // linear interp
+                ((raw as f32 / 4095.0_f32).sqrt() * 153.0 * 256.0) as u32
             };
-            vol_smoothed = (vol_smoothed * (256 - alpha) + fp * alpha) / 256;
-            // sqrt curve: concentrates resolution at high pot positions
-            let x = vol_smoothed as f32 / (4095.0 * 16.0);
-            let vol = (x.sqrt() * 153.0) as u8;
+            if vol_smoothed == u32::MAX { vol_smoothed = raw_fp; }
+            // Per-step clamp: even if 3+ of 5 median samples are corrupted, the output
+            // can move at most 20 vol-units per 10 ms toward the bad value.
+            // Full range (153 units) takes ≥ 77 ms — covers any legitimate fast turn.
+            let clamped_fp = raw_fp.clamp(
+                vol_smoothed.saturating_sub(20 * 256),
+                vol_smoothed + 20 * 256,
+            );
+            // EMA on the clamped median.
+            let error = clamped_fp.abs_diff(vol_smoothed);
+            let alpha: u32 = if error <= 2 * 256 {
+                32   // at rest — heavy smoothing
+            } else if error >= 12 * 256 {
+                256  // clearly moving — instant track
+            } else {
+                32 + (error - 2 * 256) * 224 / (10 * 256)
+            };
+            vol_smoothed = (vol_smoothed * (256 - alpha) + clamped_fp * alpha) / 256;
+            let vol = (vol_smoothed / 256) as u8;
             let prev = VOLUME_PCT.load(Ordering::Relaxed);
-            if prev == 255 || (vol as i16 - prev as i16).abs() >= 2 {
+            if prev == 255 || (vol as i16 - prev as i16).abs() >= 3 {
                 VOLUME_PCT.store(vol, Ordering::Relaxed);
-            }
-        }
-
-        // ── Light potentiometer (GPIO 35, ADC1) ──────────────────────────────
-        if now - last_light_read_ms >= 10 {
-            last_light_read_ms = now;
-            let raw = light_pin.read_raw().unwrap_or(0) as u32;
-            let fp = raw * 16;
-            if light_smoothed == u32::MAX { light_smoothed = fp; }
-            let error = fp.abs_diff(light_smoothed);
-            let alpha: u32 = if error <= 400 { 90 } else if error >= 3200 { 256 }
-                             else { 90 + (error - 400) * 166 / 2800 };
-            light_smoothed = (light_smoothed * (256 - alpha) + fp * alpha) / 256;
-            let brightness = (10 + light_smoothed * 990 / (4095 * 16)) as u16;
-            let prev = LIGHT_BRIGHTNESS.load(Ordering::Relaxed);
-            if prev == 0 || (brightness as i32 - prev as i32).abs() >= 5 {
-                LIGHT_BRIGHTNESS.store(brightness, Ordering::Relaxed);
             }
         }
 
@@ -734,6 +714,9 @@ fn main() {
         if want_backlight && wifi_connected { led_green.set_high().unwrap(); led_red.set_low().unwrap(); }
         else if want_backlight             { led_green.set_low().unwrap();  led_red.set_high().unwrap(); }
         else                               { led_green.set_low().unwrap();  led_red.set_low().unwrap(); }
+        // Blue LED: mic unmuted = on.
+        if MIC_UNMUTED.load(Ordering::Relaxed) { led_blue.set_high().unwrap(); }
+        else                                    { led_blue.set_low().unwrap(); }
 
         // ── WiFi status + auto-reconnect every 15 s ──────────────────────────────
         if now - last_wifi_check_ms >= 15_000 {
@@ -778,7 +761,8 @@ fn main() {
 
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
-static LIGHT_BRIGHTNESS: AtomicU16 = AtomicU16::new(0); // 0 = not yet read
+static MIC_UNMUTED: AtomicBool = AtomicBool::new(false);
+
 
 fn spawn_media_server() {
     std::thread::Builder::new()
@@ -816,6 +800,33 @@ fn spawn_media_server() {
                         info!("[media-srv] laptop disconnected");
                     }
                     Err(_) => break,
+                }
+            }
+        })
+        .ok();
+}
+
+fn spawn_mic_server() {
+    std::thread::Builder::new()
+        .name("mic-srv".into())
+        .stack_size(4096)
+        .spawn(|| {
+            use std::net::TcpListener;
+            let listener = match TcpListener::bind("0.0.0.0:9877") {
+                Ok(l) => l,
+                Err(e) => { info!("[mic-srv] bind err: {e}"); return; }
+            };
+            info!("[mic-srv] listening on :9877");
+            for stream in listener.incoming() {
+                if let Ok(s) = stream {
+                    let mut line = String::new();
+                    if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
+                        match line.trim() {
+                            "m:1" => { MIC_UNMUTED.store(true,  Ordering::Relaxed); info!("[mic] unmuted"); }
+                            "m:0" => { MIC_UNMUTED.store(false, Ordering::Relaxed); info!("[mic] muted");   }
+                            _ => {}
+                        }
+                    }
                 }
             }
         })

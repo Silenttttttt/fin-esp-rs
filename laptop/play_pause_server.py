@@ -8,12 +8,38 @@ Auto-reconnects if the ESP32 reboots or WiFi drops.
 import os
 import socket
 import subprocess
+import threading
 import logging
 import sys
 import time
 
 ESP_IP   = os.environ.get('ESP_IP', '192.168.1.x')
 ESP_PORT = 9876
+
+# Volume worker: always applies the latest value, never queues up stale ones.
+_vol_lock   = threading.Lock()
+_vol_target = None
+_vol_event  = threading.Event()
+
+def _vol_worker():
+    while True:
+        _vol_event.wait()
+        _vol_event.clear()
+        with _vol_lock:
+            val = _vol_target
+        if val is not None:
+            subprocess.run(
+                ['pactl', 'set-sink-volume', '@DEFAULT_SINK@', f'{val}%'],
+                capture_output=True,
+            )
+
+threading.Thread(target=_vol_worker, daemon=True).start()
+
+def set_volume(vol: str):
+    global _vol_target
+    with _vol_lock:
+        _vol_target = vol
+    _vol_event.set()
 
 def handle(line: str):
     line = line.strip()
@@ -23,10 +49,7 @@ def handle(line: str):
     elif line.startswith('v:'):
         vol = line[2:]
         logging.info('volume → %s%%', vol)
-        subprocess.run(
-            ['pactl', 'set-sink-volume', '@DEFAULT_SINK@', f'{vol}%'],
-            capture_output=True,
-        )
+        set_volume(vol)
 
 if __name__ == '__main__':
     logging.basicConfig(
@@ -46,7 +69,7 @@ if __name__ == '__main__':
                 s.settimeout(None)
                 buf = b''
                 while True:
-                    chunk = s.recv(64)
+                    chunk = s.recv(256)
                     if not chunk:
                         break
                     buf += chunk
