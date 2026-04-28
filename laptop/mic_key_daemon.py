@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Evdev key daemon — handles keys that GNOME/Wayland can't grab as custom shortcuts.
-Runs as a user service. Requires 'input' group membership.
+Evdev key daemon — handles bare Insert on GNOME/Wayland (can't be grabbed as a
+custom shortcut). Runs as a user service. Requires 'input' group membership.
 
 Keys handled:
-  Insert      → mic toggle (pactl + ESP32 LED)
-  Scroll Lock → playerctl play-pause
+  Insert → mic toggle (pactl + ESP32 LED)
 """
 import os
 import queue
@@ -21,7 +20,7 @@ from evdev import ecodes
 ESP_IP   = os.environ.get('ESP_IP', '192.168.1.x')
 ESP_PORT = 9877
 
-WATCHED_KEYS = {ecodes.KEY_INSERT, ecodes.KEY_SCROLLLOCK}
+WATCHED_KEYS = {ecodes.KEY_INSERT}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,8 +69,7 @@ def _burst_worker(q, action):
             continue
         action(count)
 
-_mic_q  = queue.Queue()
-_play_q = queue.Queue()
+_mic_q = queue.Queue()
 
 def _mic_action(count):
     global _muted
@@ -81,34 +79,40 @@ def _mic_action(count):
     logging.info('%s (burst=%d)', 'muted' if _muted else 'unmuted', count)
     _esp_event.set()   # signal sender — it reads current _muted, so always correct
 
-def _play_action(count):
-    logging.info('play-pause (burst=%d)', count)
-    subprocess.run(['playerctl', 'play-pause'], capture_output=True)
-
-threading.Thread(target=_burst_worker, args=(_mic_q,  _mic_action),  daemon=True, name='mic-worker').start()
-threading.Thread(target=_burst_worker, args=(_play_q, _play_action), daemon=True, name='play-worker').start()
+threading.Thread(target=_burst_worker, args=(_mic_q, _mic_action), daemon=True, name='mic-worker').start()
 
 _key_queue = {
-    ecodes.KEY_INSERT:     _mic_q,
-    ecodes.KEY_SCROLLLOCK: _play_q,
+    ecodes.KEY_INSERT: _mic_q,
 }
 
-# ── evdev listener — dedup across device nodes ────────────────────────────────
-_last_seen:  dict[int, float] = {}
-_dedup_lock = threading.Lock()
-_DEDUP_S    = 0.05   # 50 ms: collapses same key from multiple HID nodes
+# ── evdev listener ────────────────────────────────────────────────────────────
+# _held: keys currently physically down (across all devices).
+# A key can only fire once per press — key-up resets it.
+# Also dedup across HID nodes with a 50 ms window on key-down.
+_held      = set()
+_last_down: dict[int, float] = {}
+_state_lock = threading.Lock()
 
 def watch_device(dev):
     logging.info('watching %s (%s)', dev.path, dev.name)
     try:
         for event in dev.read_loop():
-            if event.type != ecodes.EV_KEY or event.code not in _key_queue or event.value != 1:
+            if event.type != ecodes.EV_KEY or event.code not in _key_queue:
+                continue
+            if event.value == 0:            # key-up: allow next press
+                with _state_lock:
+                    _held.discard(event.code)
+                continue
+            if event.value != 1:            # ignore standard repeat (value=2)
                 continue
             now = time.monotonic()
-            with _dedup_lock:
-                if now - _last_seen.get(event.code, 0) < _DEDUP_S:
-                    continue
-                _last_seen[event.code] = now
+            with _state_lock:
+                if event.code in _held:
+                    continue                # key still held — repeat, skip
+                if now - _last_down.get(event.code, 0) < 0.05:
+                    continue                # HID duplicate from another node
+                _held.add(event.code)
+                _last_down[event.code] = now
             _key_queue[event.code].put(1)
     except Exception as e:
         logging.warning('device %s lost: %s', dev.path, e)
@@ -118,6 +122,8 @@ def find_keyboards():
     for path in evdev.list_devices():
         try:
             d = evdev.InputDevice(path)
+            if 'Consumer Control' in d.name:
+                continue    # media-only interface — sends Insert with firmware delay, skip it
             caps = d.capabilities()
             if ecodes.EV_KEY in caps and any(k in caps[ecodes.EV_KEY] for k in WATCHED_KEYS):
                 devs.append(d)
