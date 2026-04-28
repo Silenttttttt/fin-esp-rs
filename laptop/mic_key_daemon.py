@@ -41,7 +41,7 @@ def _esp_sender():
         _esp_event.clear()
         state = 'm:0' if _muted else 'm:1'
         try:
-            s = socket.create_connection((ESP_IP, ESP_PORT), timeout=2)
+            s = socket.create_connection((ESP_IP, ESP_PORT), timeout=1)
             s.sendall(f'{state}\n'.encode())
             s.close()
             logging.info('ESP32 <- %s', state)
@@ -74,10 +74,10 @@ _mic_q = queue.Queue()
 def _mic_action(count):
     global _muted
     _muted = not _muted
-    subprocess.run(['pactl', 'set-source-mute', _src, '1' if _muted else '0'],
-                   capture_output=True)
+    subprocess.Popen(['pactl', 'set-source-mute', _src, '1' if _muted else '0'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     logging.info('%s (burst=%d)', 'muted' if _muted else 'unmuted', count)
-    _esp_event.set()   # signal sender — it reads current _muted, so always correct
+    _esp_event.set()
 
 threading.Thread(target=_burst_worker, args=(_mic_q, _mic_action), daemon=True, name='mic-worker').start()
 
