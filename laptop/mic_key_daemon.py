@@ -17,7 +17,7 @@ import time
 import evdev
 from evdev import ecodes
 
-ESP_IP   = os.environ.get('ESP_IP', '192.168.1.x')
+ESP_IP   = os.environ.get('ESP_IP', '192.168.1.240')
 ESP_PORT = 9877
 
 WATCHED_KEYS = {ecodes.KEY_INSERT}
@@ -35,23 +35,21 @@ _muted = subprocess.check_output(['pactl', 'get-source-mute', _src]).decode().sp
 # ── ESP sender — latest-wins, never blocks the mic worker ─────────────────────
 _esp_event = threading.Event()
 
-_HEARTBEAT_INTERVAL = 30.0  # resync LED this often in case ESP32 rebooted
-
 def _esp_sender():
-    next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL
     while True:
-        timeout = max(0.0, next_heartbeat - time.monotonic())
-        _esp_event.wait(timeout=timeout)
+        _esp_event.wait()
         _esp_event.clear()
         state = 'm:0' if _muted else 'm:1'
-        try:
-            s = socket.create_connection((ESP_IP, ESP_PORT), timeout=1)
-            s.sendall(f'{state}\n'.encode())
-            s.close()
-            logging.info('ESP32 <- %s', state)
-        except Exception as e:
-            logging.warning('ESP32 send failed: %s', e)
-        next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL
+        for attempt in range(4):
+            try:
+                s = socket.create_connection((ESP_IP, ESP_PORT), timeout=3)
+                s.sendall(f'{state}\n'.encode())
+                s.close()
+                logging.info('ESP32 <- %s', state)
+                break
+            except Exception as e:
+                logging.warning('ESP32 send failed (attempt %d): %s', attempt + 1, e)
+                time.sleep(1)
 
 threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
 
@@ -120,8 +118,7 @@ def watch_device(dev):
                 _last_down[event.code] = now
             _key_queue[event.code].put(1)
     except Exception as e:
-        logging.warning('device %s lost: %s — exiting for systemd restart', dev.path, e)
-        os._exit(1)
+        logging.warning('device %s lost: %s', dev.path, e)
 
 def find_keyboards():
     devs = []
