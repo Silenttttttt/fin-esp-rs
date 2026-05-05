@@ -35,9 +35,13 @@ _muted = subprocess.check_output(['pactl', 'get-source-mute', _src]).decode().sp
 # ── ESP sender — latest-wins, never blocks the mic worker ─────────────────────
 _esp_event = threading.Event()
 
+_HEARTBEAT_INTERVAL = 30.0  # resync LED this often in case ESP32 rebooted
+
 def _esp_sender():
+    next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL
     while True:
-        _esp_event.wait()
+        timeout = max(0.0, next_heartbeat - time.monotonic())
+        _esp_event.wait(timeout=timeout)
         _esp_event.clear()
         state = 'm:0' if _muted else 'm:1'
         try:
@@ -47,6 +51,7 @@ def _esp_sender():
             logging.info('ESP32 <- %s', state)
         except Exception as e:
             logging.warning('ESP32 send failed: %s', e)
+        next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL
 
 threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
 
@@ -115,7 +120,8 @@ def watch_device(dev):
                 _last_down[event.code] = now
             _key_queue[event.code].put(1)
     except Exception as e:
-        logging.warning('device %s lost: %s', dev.path, e)
+        logging.warning('device %s lost: %s — exiting for systemd restart', dev.path, e)
+        os._exit(1)
 
 def find_keyboards():
     devs = []

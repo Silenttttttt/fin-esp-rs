@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HD44780 Glyph Editor</title>
+<style>
+  body { background: #1e1e1e; color: #ccc; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 40px; }
+  h1 { font-size: 1.1rem; margin-bottom: 24px; color: #fff; }
+
+  .editor { display: flex; gap: 48px; align-items: flex-start; }
+
+  .grid-wrap { display: flex; flex-direction: column; gap: 4px; }
+  .grid-row  { display: flex; gap: 4px; }
+  .cell {
+    width: 36px; height: 36px;
+    background: #111;
+    border: 1px solid #444;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: background 0.08s;
+  }
+  .cell.on { background: #5cf; border-color: #5cf; }
+
+  .preview-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .preview-label { font-size: 0.75rem; color: #888; }
+  canvas { image-rendering: pixelated; border: 1px solid #444; }
+
+  .output-wrap { margin-top: 32px; width: 100%; max-width: 700px; }
+  .name-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .name-row input {
+    background: #2a2a2a; border: 1px solid #555; color: #fff;
+    padding: 6px 10px; font-family: monospace; font-size: 0.9rem;
+    border-radius: 4px; flex: 1;
+  }
+  .name-row input:focus { outline: none; border-color: #5cf; }
+  .copy-btn {
+    background: #2a6; color: #fff; border: none; padding: 6px 14px;
+    border-radius: 4px; cursor: pointer; font-family: monospace;
+  }
+  .copy-btn:active { background: #194; }
+
+  pre {
+    background: #111; border: 1px solid #444; padding: 16px;
+    border-radius: 6px; overflow-x: auto; font-size: 0.88rem;
+    color: #5cf; user-select: all; margin: 0;
+  }
+
+  .controls { display: flex; gap: 8px; margin-top: 12px; }
+  .btn {
+    background: #333; color: #ccc; border: 1px solid #555;
+    padding: 5px 12px; border-radius: 4px; cursor: pointer;
+    font-family: monospace; font-size: 0.82rem;
+  }
+  .btn:hover { background: #444; color: #fff; }
+</style>
+</head>
+<body>
+<h1>HD44780 Glyph Editor — 5×8</h1>
+
+<div class="editor">
+  <div>
+    <div class="grid-wrap" id="grid"></div>
+    <div class="controls">
+      <button class="btn" onclick="clearGrid()">Clear</button>
+      <button class="btn" onclick="fillGrid()">Fill</button>
+      <button class="btn" onclick="invertGrid()">Invert</button>
+      <button class="btn" onclick="shiftUp()">↑</button>
+      <button class="btn" onclick="shiftDown()">↓</button>
+      <button class="btn" onclick="shiftLeft()">←</button>
+      <button class="btn" onclick="shiftRight()">→</button>
+    </div>
+  </div>
+
+  <div class="preview-wrap">
+    <div class="preview-label">Preview (×8)</div>
+    <canvas id="preview" width="40" height="64" style="width:160px;height:256px;"></canvas>
+    <div class="preview-label" id="hex-bytes" style="margin-top:8px;color:#5cf"></div>
+  </div>
+</div>
+
+<div class="output-wrap">
+  <div class="name-row">
+    <input id="glyph-name" type="text" value="GLYPH_NEW" placeholder="const name" />
+    <button class="copy-btn" onclick="copyOutput()">Copy</button>
+  </div>
+  <pre id="output"></pre>
+</div>
+
+<script>
+const ROWS = 8, COLS = 5;
+const grid = Array.from({length: ROWS}, () => new Array(COLS).fill(0));
+
+let mouseDown = false, paintValue = 1;
+document.addEventListener('mousedown', e => { mouseDown = true; });
+document.addEventListener('mouseup',   e => { mouseDown = false; });
+
+function buildGrid() {
+  const wrap = document.getElementById('grid');
+  wrap.innerHTML = '';
+  for (let r = 0; r < ROWS; r++) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'grid-row';
+    for (let c = 0; c < COLS; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell' + (grid[r][c] ? ' on' : '');
+      cell.dataset.r = r; cell.dataset.c = c;
+      cell.addEventListener('mousedown', e => { paintValue = grid[r][c] ? 0 : 1; toggle(r, c); });
+      cell.addEventListener('mouseover', e => { if (mouseDown) toggle(r, c, paintValue); });
+      rowEl.appendChild(cell);
+    }
+    wrap.appendChild(rowEl);
+  }
+  update();
+}
+
+function toggle(r, c, val) {
+  grid[r][c] = (val !== undefined) ? val : (grid[r][c] ? 0 : 1);
+  document.querySelectorAll('.cell').forEach(el => {
+    if (+el.dataset.r === r && +el.dataset.c === c) {
+      el.className = 'cell' + (grid[r][c] ? ' on' : '');
+    }
+  });
+  update();
+}
+
+function rowByte(r) {
+  let b = 0;
+  for (let c = 0; c < COLS; c++) {
+    if (grid[r][c]) b |= (1 << (COLS - 1 - c));
+  }
+  return b;
+}
+
+function update() {
+  const bytes = Array.from({length: ROWS}, (_, r) => rowByte(r));
+  const hex = bytes.map(b => '0x' + b.toString(16).toUpperCase().padStart(2, '0')).join(', ');
+  const name = document.getElementById('glyph-name').value.trim() || 'GLYPH_NEW';
+  document.getElementById('output').textContent =
+    `pub const ${name}: Glyph = [${hex}];`;
+  document.getElementById('hex-bytes').textContent = bytes.map(b => b.toString(16).padStart(2,'0')).join(' ');
+  drawPreview(bytes);
+}
+
+function drawPreview(bytes) {
+  const canvas = document.getElementById('preview');
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, 40, 64);
+  ctx.fillStyle = '#5cf';
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 5; c++) {
+      if (bytes[r] & (1 << (4 - c))) {
+        ctx.fillRect(c * 8, r * 8, 7, 7);
+      }
+    }
+  }
+}
+
+function clearGrid()  { for(let r=0;r<ROWS;r++) grid[r].fill(0); buildGrid(); }
+function fillGrid()   { for(let r=0;r<ROWS;r++) grid[r].fill(1); buildGrid(); }
+function invertGrid() { for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++) grid[r][c]^=1; buildGrid(); }
+function shiftUp()    { grid.push(grid.shift()); buildGrid(); }
+function shiftDown()  { grid.unshift(grid.pop()); buildGrid(); }
+function shiftLeft()  { for(let r=0;r<ROWS;r++) { grid[r].push(grid[r].shift()); } buildGrid(); }
+function shiftRight() { for(let r=0;r<ROWS;r++) { grid[r].unshift(grid[r].pop()); } buildGrid(); }
+
+function copyOutput() {
+  navigator.clipboard.writeText(document.getElementById('output').textContent);
+}
+
+// Load from hex string e.g. "01 03 07 1F 07 03 01 00"
+function loadHex(hexStr) {
+  const bytes = hexStr.trim().split(/[\s,x]+/).filter(s => /^[0-9a-fA-F]+$/.test(s)).map(s => parseInt(s, 16));
+  for (let r = 0; r < ROWS; r++) {
+    const b = bytes[r] ?? 0;
+    for (let c = 0; c < COLS; c++) {
+      grid[r][c] = (b >> (4 - c)) & 1;
+    }
+  }
+  buildGrid();
+}
+
+document.getElementById('glyph-name').addEventListener('input', update);
+
+// Init with POT_ON glyph
+loadHex('01 03 07 1F 07 03 01 00');
+</script>
+</body>
+</html>

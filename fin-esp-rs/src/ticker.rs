@@ -1,7 +1,7 @@
 use crate::api;
 use crate::cgram::{
-    SLOT_ASSET, SLOT_DEGREE, SLOT_DOWN_ARROW, SLOT_HOURGLASS,
-    SLOT_LAMP, SLOT_SUN_CLOUD, SLOT_UP_ARROW, SLOT_WIFI,
+    SLOT_ASSET, SLOT_DEGREE, SLOT_HOURGLASS,
+    SLOT_LAMP, SLOT_POT, SLOT_SUN_CLOUD, SLOT_UP_ARROW, SLOT_WIFI,
 };
 use crate::config::{self, Screen};
 use crate::fmt;
@@ -84,8 +84,17 @@ fn all_glyphs(state: &UiState, now_ms: u64) -> [[u8; 8]; 8] {
         glyphs::GLYPH_WIFI_OFF
     };
 
-    g[SLOT_UP_ARROW   as usize] = glyphs::GLYPH_UP_ARROW;
-    g[SLOT_DOWN_ARROW as usize] = glyphs::GLYPH_DOWN_ARROW;
+    // Shared arrow slot: set to the direction the current screen needs.
+    let cur_chg = match state.screen {
+        config::Screen::Btc    => state.data.chg_btc_pct,
+        config::Screen::Sol    => state.data.chg_sol_pct,
+        config::Screen::Gold   => state.data.chg_gold_pct,
+        config::Screen::Oil    => state.data.chg_oil_pct,
+        config::Screen::UsdBrl => state.data.chg_usd_brl_pct,
+    };
+    g[SLOT_UP_ARROW as usize] = if cur_chg >= 0.0 { glyphs::GLYPH_UP_ARROW } else { glyphs::GLYPH_DOWN_ARROW };
+
+    g[SLOT_POT as usize] = if state.pot_enabled { glyphs::GLYPH_POT_ON } else { glyphs::GLYPH_POT_OFF };
 
     g[SLOT_SUN_CLOUD as usize] = if state.data.weather_code
         .map(api::wmo_is_rain)
@@ -123,6 +132,7 @@ fn build_header(state: &UiState, now_ms: u64) -> [u8; 20] {
     let mut row = [b' '; 20];
 
     row[0] = SLOT_WIFI;
+    row[1] = SLOT_POT;
     row[3] = if state.fetching || state.fetch_completed_at > 0 {
         SLOT_HOURGLASS
     } else {
@@ -179,7 +189,7 @@ fn build_change_row(state: &UiState) -> [u8; 20] {
     let mut col = 0usize;
 
     if has_chg {
-        row[col] = if chg >= 0.0 { SLOT_UP_ARROW } else { SLOT_DOWN_ARROW };
+        row[col] = SLOT_UP_ARROW; // glyph set to correct direction in all_glyphs()
         col += 1;
         for b in format!("{:.1}%", chg).bytes() {
             if col >= 8 { break; }

@@ -14,8 +14,8 @@ use crate::lcd::Lcd;
 // These are used by screen.rs after sand is done.
 pub const SLOT_LAMP:       u8 = 0;
 pub const SLOT_WIFI:       u8 = 1;
-pub const SLOT_UP_ARROW:   u8 = 2;
-pub const SLOT_DOWN_ARROW: u8 = 3;
+pub const SLOT_UP_ARROW:   u8 = 2; // shared slot — glyph set to up or down each frame
+pub const SLOT_POT:        u8 = 3; // pot enabled/disabled indicator
 pub const SLOT_SUN_CLOUD:  u8 = 4;
 pub const SLOT_DEGREE:     u8 = 5;
 pub const SLOT_HOURGLASS:  u8 = 6;

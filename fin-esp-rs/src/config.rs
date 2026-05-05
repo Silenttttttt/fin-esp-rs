@@ -58,6 +58,11 @@ pub const LAMP_TOGGLE_ANIM_MS: u64 = 4_000;
 pub const DEBOUNCE_MS: u64 = 50;
 pub const CHART_DURATION_MS: u64 = 30_000;
 
+// Volume potentiometer calibration (raw ADC 0-4095).
+// Tune these if the pot doesn't reach 0% or 100% at its physical stops.
+pub const POT_ADC_MIN: u32 = 285;  // ADC value at pot's fully-left stop
+pub const POT_ADC_MAX: u32 = 3063; // ADC value at pot's fully-right stop
+
 // HTTP
 pub const HTTP_RETRIES: u32 = 2;
 pub const HTTP_RETRY_DELAY_MS: u64 = 800;

@@ -25,7 +25,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
-use log::info;
+use log::{info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};
@@ -91,7 +91,24 @@ fn main() {
             info!("[boot] brownout reset — settling 3 s");
             FreeRtos::delay_ms(3000);
         }
-        _ => {}
+        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_PANIC => {
+            info!("[boot] reset reason: PANIC (stack overflow or abort)");
+        }
+        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_INT_WDT => {
+            info!("[boot] reset reason: INT WATCHDOG");
+        }
+        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_TASK_WDT => {
+            info!("[boot] reset reason: TASK WATCHDOG");
+        }
+        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_WDT => {
+            info!("[boot] reset reason: OTHER WATCHDOG");
+        }
+        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_SW => {
+            info!("[boot] reset reason: software reset (OTA or esp_restart)");
+        }
+        r => {
+            info!("[boot] reset reason: unknown ({})", r);
+        }
     }
 
     let btn_screen  = PinDriver::input(peripherals.pins.gpio26, Pull::Up).unwrap();
@@ -300,18 +317,15 @@ fn main() {
     std::thread::Builder::new()
         .name("finFetch".into())
         .stack_size(20480)
-        .spawn(move || loop {
+        .spawn(move || {
+            let (wa, wb) = api::spawn_fetch_workers();
+            loop {
             info!("[net] fetch cycle start");
             let mut data = api::MarketData::default();
 
-            // Re-read screen at the top of every cycle (fresh after a trigger).
-            let (current, next) = {
-                let st = ui_net.lock().unwrap();
-                (st.screen, st.screen.next())
-            };
             if let Ok(mut st) = ui_net.lock() { st.fetching = true; st.loading_frame = 0; }
 
-            api::fetch_all(&mut data, current, next);
+            api::fetch_all(&mut data, &wa, &wb);
 
             cache::save(&nvs_fetch, &data);
 
@@ -329,6 +343,7 @@ fn main() {
                 if remaining == 0 { break; }
                 std::thread::sleep(Duration::from_millis(remaining.min(100)));
             }
+            } // loop
         })
         .unwrap();
 
@@ -771,36 +786,42 @@ fn spawn_media_server() {
         .spawn(|| {
             use std::io::Write;
             use std::net::TcpListener;
-            let listener = match TcpListener::bind("0.0.0.0:9876") {
-                Ok(l) => l,
-                Err(e) => { info!("[media-srv] bind err: {e}"); return; }
-            };
-            info!("[media-srv] listening on :9876");
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(mut s) => {
-                        info!("[media-srv] laptop connected");
-                        // Treat current pot position as already-sent so we don't
-                        // override the laptop's volume on connect — only actual
-                        // pot movement triggers an update.
-                        let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
-                        loop {
-                            if PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
-                                if s.write_all(b"p\n").is_err() { break; }
-                                info!("[media-srv] play/pause sent");
+            loop {
+                let listener = match TcpListener::bind("0.0.0.0:9876") {
+                    Ok(l) => l,
+                    Err(e) => { warn!("[media-srv] bind err: {e}, retrying"); FreeRtos::delay_ms(2000); continue; }
+                };
+                info!("[media-srv] listening on :9876");
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(mut s) => {
+                            info!("[media-srv] laptop connected");
+                            let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
+                            let mut keepalive: u32 = 0;
+                            loop {
+                                if PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
+                                    if s.write_all(b"p\n").is_err() { break; }
+                                    info!("[media-srv] play/pause sent");
+                                }
+                                let vol = VOLUME_PCT.load(Ordering::Relaxed);
+                                if vol != 255 && vol != last_vol {
+                                    let msg = std::format!("v:{}\n", vol);
+                                    if s.write_all(msg.as_bytes()).is_err() { break; }
+                                    last_vol = vol;
+                                }
+                                keepalive += 1;
+                                if keepalive >= 3000 {
+                                    if s.write_all(b"k\n").is_err() { break; }
+                                    keepalive = 0;
+                                }
+                                FreeRtos::delay_ms(10);
                             }
-                            let vol = VOLUME_PCT.load(Ordering::Relaxed);
-                            if vol != 255 && vol != last_vol {
-                                let msg = std::format!("v:{}\n", vol);
-                                if s.write_all(msg.as_bytes()).is_err() { break; }
-                                last_vol = vol;
-                            }
-                            FreeRtos::delay_ms(10);
+                            info!("[media-srv] laptop disconnected");
                         }
-                        info!("[media-srv] laptop disconnected");
+                        Err(e) => { warn!("[media-srv] accept err: {e}"); break; }
                     }
-                    Err(_) => break,
                 }
+                FreeRtos::delay_ms(1000);
             }
         })
         .ok();
@@ -809,25 +830,32 @@ fn spawn_media_server() {
 fn spawn_mic_server() {
     std::thread::Builder::new()
         .name("mic-srv".into())
-        .stack_size(4096)
+        .stack_size(6144)
         .spawn(|| {
             use std::net::TcpListener;
-            let listener = match TcpListener::bind("0.0.0.0:9877") {
-                Ok(l) => l,
-                Err(e) => { info!("[mic-srv] bind err: {e}"); return; }
-            };
-            info!("[mic-srv] listening on :9877");
-            for stream in listener.incoming() {
-                if let Ok(s) = stream {
-                    let mut line = String::new();
-                    if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
-                        match line.trim() {
-                            "m:1" => { MIC_UNMUTED.store(true,  Ordering::Relaxed); info!("[mic] unmuted"); }
-                            "m:0" => { MIC_UNMUTED.store(false, Ordering::Relaxed); info!("[mic] muted");   }
-                            _ => {}
+            loop {
+                let listener = match TcpListener::bind("0.0.0.0:9877") {
+                    Ok(l) => l,
+                    Err(e) => { warn!("[mic-srv] bind err: {e}, retrying"); FreeRtos::delay_ms(2000); continue; }
+                };
+                info!("[mic-srv] listening on :9877");
+                let mut err = false;
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(s) => {
+                            let mut line = String::new();
+                            if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
+                                match line.trim() {
+                                    "m:1" => { MIC_UNMUTED.store(true,  Ordering::Relaxed); info!("[mic] unmuted"); }
+                                    "m:0" => { MIC_UNMUTED.store(false, Ordering::Relaxed); info!("[mic] muted");   }
+                                    _ => {}
+                                }
+                            }
                         }
+                        Err(e) => { warn!("[mic-srv] accept err: {e}"); err = true; break; }
                     }
                 }
+                if err { FreeRtos::delay_ms(1000); }
             }
         })
         .ok();

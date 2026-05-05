@@ -9,9 +9,13 @@ pub const GLYPH_LAMP_UNK: Glyph = [0b01110, 0b10001, 0b10101, 0b10001, 0b10101, 
 pub const GLYPH_WIFI_ON: Glyph = [0b00000, 0b00100, 0b01110, 0b11111, 0b00100, 0b00100, 0b00100, 0b00000];
 pub const GLYPH_WIFI_OFF: Glyph = [0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b00000, 0b00000];
 
-// Price change arrows (slots 2 and 3 — freed from SUN/CLOUD, weather uses SUN_CLOUD for all conditions)
+// Price change arrows — share slot 2 (up or down set each frame, never both visible)
 pub const GLYPH_UP_ARROW: Glyph   = [0x00, 0x04, 0x0E, 0x1F, 0x00, 0x00, 0x00, 0x00]; // ▲
 pub const GLYPH_DOWN_ARROW: Glyph = [0x00, 0x1F, 0x0E, 0x04, 0x00, 0x00, 0x00, 0x00]; // ▼
+
+// Pot (volume knob) enabled/disabled — slot 3
+pub const GLYPH_POT_ON:  Glyph = [0x01, 0x03, 0x07, 0x1F, 0x07, 0x03, 0x01, 0x00]; // filled triangle ▶
+pub const GLYPH_POT_OFF: Glyph = [0x01, 0x02, 0x04, 0x18, 0x04, 0x02, 0x01, 0x00]; // hollow triangle ▷
 
 // Weather (slot 4 only — SUN and CLOUD slots repurposed for arrows above)
 pub const GLYPH_SUN_CLOUD: Glyph = [0b00100, 0b10101, 0b01110, 0b11111, 0b11111, 0b01110, 0b00000, 0b00000];

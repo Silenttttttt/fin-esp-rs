@@ -59,6 +59,7 @@ pub struct UiState {
     pub lamp_loading_frame: u16,
     pub fetch_completed_at: u64,
     pub lamp_anim_until: u64,
+    pub pot_enabled: bool,
 }
 
 impl Default for UiState {
@@ -73,6 +74,7 @@ impl Default for UiState {
             lamp_loading_frame: 0,
             fetch_completed_at: 0,
             lamp_anim_until: 0,
+            pot_enabled: true,
         }
     }
 }

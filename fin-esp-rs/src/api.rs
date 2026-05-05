@@ -2,9 +2,11 @@ use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use log::{info, warn};
 use serde_json::Value;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::Duration;
 
-use crate::config::{self, Screen};
+use crate::config;
 
 /// Market data collected from all API sources.
 #[derive(Default, Clone, Debug)]
@@ -41,16 +43,19 @@ impl MarketData {
 }
 
 fn https_get(url: &str) -> Result<String, String> {
-    let config = HttpConfig {
+    let http_config = HttpConfig {
         timeout: Some(Duration::from_millis(config::HTTP_TIMEOUT_MS)),
         use_global_ca_store: true,
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
     };
-    let mut conn =
-        EspHttpConnection::new(&config).map_err(|e| format!("HTTP conn: {e}"))?;
 
+    // Fresh connection per attempt — reusing across retries without draining the
+    // response body leaks internal HTTP client buffers on non-200 responses.
     for attempt in 0..config::HTTP_RETRIES {
+        let mut conn = EspHttpConnection::new(&http_config)
+            .map_err(|e| format!("HTTP conn: {e}"))?;
+
         conn.initiate_request(Method::Get, url, &[])
             .map_err(|e| format!("HTTP init: {e}"))?;
         conn.initiate_response()
@@ -69,6 +74,9 @@ fn https_get(url: &str) -> Result<String, String> {
             }
             return String::from_utf8(body).map_err(|e| format!("UTF-8: {e}"));
         }
+
+        // conn dropped here — cleans up TLS session and HTTP client resources.
+        drop(conn);
 
         if status == 429 || status == 503 {
             warn!("[API] HTTP {status}, backing off 20s");
@@ -218,59 +226,98 @@ pub fn merge(data: &mut MarketData, r: MarketData) {
     }
 }
 
-/// Fetch all market data using 2 workers, prioritising the current and next screen.
-///
-/// Worker A owns: crypto (BTC+SOL) and USD/BRL.
-/// Worker B owns: gold, oil, and weather.
-/// Within each worker the fetch that serves the current or next visible screen
-/// runs first, so the user always sees fresh data for what they're looking at.
-pub fn fetch_all(data: &mut MarketData, current: Screen, next: Screen) {
-    use std::thread;
+// ── Persistent fetch workers ───────────────────────────────────────────────────
+// Spawned once; block on a Condvar between cycles instead of being re-created.
+// Eliminates 40 KB of thread-stack heap churn every 45 s.
 
-    // True if a screen is "priority" — current or one rotation ahead.
-    let pri = |s: Screen| s == current || s == next;
+pub(crate) struct FetchWorker {
+    go:     (Mutex<bool>, Condvar),
+    result: (Mutex<Option<MarketData>>, Condvar),
+}
 
-    // Worker A: crypto vs USD/BRL — swap if USD/BRL is priority and crypto isn't.
-    let usd_first = pri(Screen::UsdBrl) && !pri(Screen::Btc) && !pri(Screen::Sol);
-
-    let ha = thread::Builder::new()
-        .name("fetchA".into())
-        .stack_size(10240)
-        .spawn(move || {
-            let mut d = MarketData::default();
-            if usd_first {
-                fetch_usd_brl(&mut d);
-                fetch_crypto(&mut d);
-            } else {
-                fetch_crypto(&mut d);
-                fetch_usd_brl(&mut d);
-            }
-            d
+impl FetchWorker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            go:     (Mutex::new(false), Condvar::new()),
+            result: (Mutex::new(None),  Condvar::new()),
         })
-        .unwrap();
+    }
 
-    // Worker B: gold vs oil — swap if oil is priority and gold isn't.
-    let oil_first = pri(Screen::Oil) && !pri(Screen::Gold);
+    pub(crate) fn trigger(&self) {
+        *self.go.0.lock().unwrap() = true;
+        self.go.1.notify_one();
+    }
 
-    let hb = thread::Builder::new()
-        .name("fetchB".into())
-        .stack_size(10240)
-        .spawn(move || {
-            let mut d = MarketData::default();
-            if oil_first {
-                fetch_oil(&mut d);
+    fn wait_go(&self) {
+        let mut g = self.go.0.lock().unwrap();
+        loop {
+            if *g { *g = false; return; }
+            g = self.go.1.wait(g).unwrap();
+        }
+    }
+
+    fn post(&self, d: MarketData) {
+        *self.result.0.lock().unwrap() = Some(d);
+        self.result.1.notify_one();
+    }
+
+    pub(crate) fn collect(&self) -> MarketData {
+        let mut g = self.result.0.lock().unwrap();
+        loop {
+            if let Some(d) = g.take() { return d; }
+            g = self.result.1.wait(g).unwrap();
+        }
+    }
+}
+
+/// Spawn the two persistent fetch workers. Call once before the fetch loop.
+pub(crate) fn spawn_fetch_workers() -> (Arc<FetchWorker>, Arc<FetchWorker>) {
+    let wa = FetchWorker::new();
+    let wb = FetchWorker::new();
+
+    {
+        let w = Arc::clone(&wa);
+        thread::Builder::new()
+            .name("fetchA".into())
+            .stack_size(32768)
+            .spawn(move || loop {
+                w.wait_go();
+                let mut d = MarketData::default();
+                fetch_crypto(&mut d);
+                fetch_usd_brl(&mut d);
+                let heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
+                info!("[fetchA] heap free: {} bytes", heap);
+                w.post(d);
+            })
+            .unwrap();
+    }
+    {
+        let w = Arc::clone(&wb);
+        thread::Builder::new()
+            .name("fetchB".into())
+            .stack_size(32768)
+            .spawn(move || loop {
+                w.wait_go();
+                let mut d = MarketData::default();
                 fetch_gold(&mut d);
-            } else {
-                fetch_gold(&mut d);
                 fetch_oil(&mut d);
-            }
-            fetch_weather(&mut d);
-            d
-        })
-        .unwrap();
+                fetch_weather(&mut d);
+                let heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
+                info!("[fetchB] heap free: {} bytes", heap);
+                w.post(d);
+            })
+            .unwrap();
+    }
 
-    merge(data, ha.join().unwrap_or_default());
-    merge(data, hb.join().unwrap_or_default());
+    (wa, wb)
+}
+
+/// Trigger both workers and collect their results into `data`.
+pub fn fetch_all(data: &mut MarketData, wa: &FetchWorker, wb: &FetchWorker) {
+    wa.trigger();
+    wb.trigger();
+    merge(data, wa.collect());
+    merge(data, wb.collect());
 }
 
 /// Convert WMO weather code to a short label for the LCD.
