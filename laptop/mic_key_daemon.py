@@ -96,6 +96,9 @@ _held      = set()
 _last_down: dict[int, float] = {}
 _state_lock = threading.Lock()
 
+_watched_paths: set[str] = set()
+_watched_lock = threading.Lock()
+
 def watch_device(dev):
     logging.info('watching %s (%s)', dev.path, dev.name)
     try:
@@ -119,6 +122,9 @@ def watch_device(dev):
             _key_queue[event.code].put(1)
     except Exception as e:
         logging.warning('device %s lost: %s', dev.path, e)
+    finally:
+        with _watched_lock:
+            _watched_paths.discard(dev.path)
 
 def find_keyboards():
     devs = []
@@ -134,14 +140,34 @@ def find_keyboards():
             pass
     return devs
 
+def _start_watching(dev):
+    with _watched_lock:
+        if dev.path in _watched_paths:
+            return
+        _watched_paths.add(dev.path)
+    t = threading.Thread(target=watch_device, args=(dev,), daemon=True)
+    t.start()
+
+def _scanner():
+    """Periodically rescan for new/reconnected keyboards."""
+    while True:
+        time.sleep(5)
+        for dev in find_keyboards():
+            with _watched_lock:
+                already = dev.path in _watched_paths
+            if not already:
+                logging.info('new device found: %s (%s)', dev.path, dev.name)
+                _start_watching(dev)
+
 if __name__ == '__main__':
     keyboards = find_keyboards()
     if not keyboards:
         logging.error('no device with watched keys — check input group membership')
         sys.exit(1)
-    threads = [threading.Thread(target=watch_device, args=(dev,), daemon=True) for dev in keyboards]
-    for t in threads:
-        t.start()
+    for dev in keyboards:
+        _start_watching(dev)
     logging.info('listening on %d device(s)', len(keyboards))
-    for t in threads:
-        t.join()
+    threading.Thread(target=_scanner, daemon=True, name='scanner').start()
+    # Keep main thread alive
+    while True:
+        time.sleep(60)
