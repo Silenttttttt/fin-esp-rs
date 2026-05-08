@@ -5,6 +5,9 @@ custom shortcut). Runs as a user service. Requires 'input' group membership.
 
 Keys handled:
   Insert → mic toggle (pactl + ESP32 LED)
+
+LED always reflects actual PulseAudio mic state — external changes (VM, GNOME,
+other tools) are picked up via `pactl subscribe` and synced automatically.
 """
 import os
 import queue
@@ -31,15 +34,28 @@ logging.basicConfig(
 # ── Mic state ──────────────────────────────────────────────────────────────────
 _src   = subprocess.check_output(['pactl', 'get-default-source']).decode().strip()
 _muted = subprocess.check_output(['pactl', 'get-source-mute', _src]).decode().split()[1] == 'yes'
+_state_mutex = threading.Lock()
 
-# ── ESP sender — latest-wins, never blocks the mic worker ─────────────────────
+def _actual_muted() -> bool:
+    try:
+        out = subprocess.check_output(
+            ['pactl', 'get-source-mute', _src],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode()
+        return out.split()[1] == 'yes'
+    except Exception:
+        return _muted
+
+# ── ESP sender — latest-wins, sends actual PulseAudio state ───────────────────
 _esp_event = threading.Event()
 
 def _esp_sender():
     while True:
         _esp_event.wait()
         _esp_event.clear()
-        state = 'm:0' if _muted else 'm:1'
+        # Always query real state — never trust the internal counter alone.
+        actual = _actual_muted()
+        state = 'm:0' if actual else 'm:1'
         for attempt in range(4):
             try:
                 s = socket.create_connection((ESP_IP, ESP_PORT), timeout=3)
@@ -56,6 +72,33 @@ threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
 # Sync LED to actual state at startup
 _esp_event.set()
 logging.info('startup: %s', 'muted' if _muted else 'unmuted')
+
+# ── PulseAudio subscriber — catches external mute changes ─────────────────────
+def _pa_subscriber():
+    """Stream pactl events; sync LED whenever mic state changes from any source."""
+    global _muted
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ['pactl', 'subscribe'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            for line in proc.stdout:
+                if 'source' not in line or 'change' not in line:
+                    continue
+                time.sleep(0.05)  # let PulseAudio settle the change
+                actual = _actual_muted()
+                with _state_mutex:
+                    if actual == _muted:
+                        continue
+                    _muted = actual
+                logging.info('mic state synced from PA: %s', 'muted' if actual else 'unmuted')
+                _esp_event.set()
+        except Exception as e:
+            logging.warning('pactl subscribe error: %s — restarting', e)
+            time.sleep(2)
+
+threading.Thread(target=_pa_subscriber, daemon=True, name='pa-sub').start()
 
 # ── Burst-collapse worker ──────────────────────────────────────────────────────
 def _burst_worker(q, action):
@@ -76,10 +119,12 @@ _mic_q = queue.Queue()
 
 def _mic_action(count):
     global _muted
-    _muted = not _muted
-    subprocess.Popen(['pactl', 'set-source-mute', _src, '1' if _muted else '0'],
+    with _state_mutex:
+        _muted = not _muted
+        target = _muted
+    subprocess.Popen(['pactl', 'set-source-mute', _src, '1' if target else '0'],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    logging.info('%s (burst=%d)', 'muted' if _muted else 'unmuted', count)
+    logging.info('%s (burst=%d)', 'muted' if target else 'unmuted', count)
     _esp_event.set()
 
 threading.Thread(target=_burst_worker, args=(_mic_q, _mic_action), daemon=True, name='mic-worker').start()
@@ -89,12 +134,9 @@ _key_queue = {
 }
 
 # ── evdev listener ────────────────────────────────────────────────────────────
-# _held: keys currently physically down (across all devices).
-# A key can only fire once per press — key-up resets it.
-# Also dedup across HID nodes with a 50 ms window on key-down.
 _held      = set()
 _last_down: dict[int, float] = {}
-_state_lock = threading.Lock()
+_dedup_lock = threading.Lock()
 
 _watched_paths: set[str] = set()
 _watched_lock = threading.Lock()
@@ -105,18 +147,18 @@ def watch_device(dev):
         for event in dev.read_loop():
             if event.type != ecodes.EV_KEY or event.code not in _key_queue:
                 continue
-            if event.value == 0:            # key-up: allow next press
-                with _state_lock:
+            if event.value == 0:
+                with _dedup_lock:
                     _held.discard(event.code)
                 continue
-            if event.value != 1:            # ignore standard repeat (value=2)
+            if event.value != 1:
                 continue
             now = time.monotonic()
-            with _state_lock:
+            with _dedup_lock:
                 if event.code in _held:
-                    continue                # key still held — repeat, skip
+                    continue
                 if now - _last_down.get(event.code, 0) < 0.05:
-                    continue                # HID duplicate from another node
+                    continue
                 _held.add(event.code)
                 _last_down[event.code] = now
             _key_queue[event.code].put(1)
@@ -132,7 +174,7 @@ def find_keyboards():
         try:
             d = evdev.InputDevice(path)
             if 'Consumer Control' in d.name:
-                continue    # media-only interface — sends Insert with firmware delay, skip it
+                continue
             caps = d.capabilities()
             if ecodes.EV_KEY in caps and any(k in caps[ecodes.EV_KEY] for k in WATCHED_KEYS):
                 devs.append(d)
@@ -149,7 +191,6 @@ def _start_watching(dev):
     t.start()
 
 def _scanner():
-    """Periodically rescan for new/reconnected keyboards."""
     while True:
         time.sleep(5)
         for dev in find_keyboards():
@@ -168,6 +209,5 @@ if __name__ == '__main__':
         _start_watching(dev)
     logging.info('listening on %d device(s)', len(keyboards))
     threading.Thread(target=_scanner, daemon=True, name='scanner').start()
-    # Keep main thread alive
     while True:
         time.sleep(60)
