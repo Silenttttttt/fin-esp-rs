@@ -46,20 +46,15 @@ def _actual_muted() -> bool:
     except Exception:
         return _muted
 
-# ── ESP sender — latest-wins, sends actual PulseAudio state ───────────────────
+# ── ESP sender — latest-wins, sends _muted immediately ────────────────────────
 _esp_event = threading.Event()
 
 def _esp_sender():
     while True:
         _esp_event.wait()
         _esp_event.clear()
-        # Let PA settle — evdev fires before the VM's PA mute lands, so without
-        # this sleep we'd sample stale state and desync the LED.
-        time.sleep(0.2)
-        if _esp_event.is_set():
-            continue  # a newer event is already waiting; let it handle the send
-        # Always query real state — never trust the internal counter alone.
-        actual = _actual_muted()
+        with _state_mutex:
+            actual = _muted
         state = 'm:0' if actual else 'm:1'
         for attempt in range(4):
             try:
@@ -71,6 +66,29 @@ def _esp_sender():
             except Exception as e:
                 logging.warning('ESP32 send failed (attempt %d): %s', attempt + 1, e)
                 time.sleep(1)
+
+# ── Deferred resync — catches VM double-toggle drift ──────────────────────────
+_resync_timer: 'threading.Timer | None' = None
+_resync_timer_lock = threading.Lock()
+
+def _schedule_resync(delay: float = 0.3):
+    """After a key action, verify actual PA state matches _muted and correct if not."""
+    global _resync_timer
+    with _resync_timer_lock:
+        if _resync_timer is not None:
+            _resync_timer.cancel()
+        _resync_timer = threading.Timer(delay, _do_resync)
+        _resync_timer.start()
+
+def _do_resync():
+    global _muted
+    actual = _actual_muted()
+    with _state_mutex:
+        if actual == _muted:
+            return
+        _muted = actual
+    logging.info('LED resynced after settle: %s', 'muted' if actual else 'unmuted')
+    _esp_event.set()
 
 threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
 
@@ -131,6 +149,7 @@ def _mic_action(count):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     logging.info('%s (burst=%d)', 'muted' if target else 'unmuted', count)
     _esp_event.set()
+    _schedule_resync(0.3)
 
 threading.Thread(target=_burst_worker, args=(_mic_q, _mic_action), daemon=True, name='mic-worker').start()
 
