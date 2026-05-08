@@ -53,6 +53,11 @@ def _esp_sender():
     while True:
         _esp_event.wait()
         _esp_event.clear()
+        # Let PA settle — evdev fires before the VM's PA mute lands, so without
+        # this sleep we'd sample stale state and desync the LED.
+        time.sleep(0.2)
+        if _esp_event.is_set():
+            continue  # a newer event is already waiting; let it handle the send
         # Always query real state — never trust the internal counter alone.
         actual = _actual_muted()
         state = 'm:0' if actual else 'm:1'
