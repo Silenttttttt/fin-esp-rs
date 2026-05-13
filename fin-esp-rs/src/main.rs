@@ -8,6 +8,7 @@ mod glyphs;
 mod history;
 mod lcd;
 mod ota;
+mod persist;
 mod sand;
 mod screen;
 mod ticker;
@@ -147,9 +148,12 @@ fn main() {
     let nvs = EspDefaultNvsPartition::take().unwrap();
     // Keep a clone for the price cache; WiFi consumes the original.
     let nvs_cache = nvs.clone();
+    let persist = persist::Persist::new(nvs_cache.clone());
 
-    // Load persisted screen state before the sand animation starts.
-    let mut screen_forced_off = load_screen_forced(&nvs_cache);
+    // Load persisted state before the sand animation starts.
+    let mut screen_forced_off = persist.load_screen_forced();
+    let initial_pot_enabled   = persist.load_pot_enabled();
+    POT_ENABLED.store(initial_pot_enabled, Ordering::Relaxed);
     let mut last_btn_display:       bool = true;
     let mut last_debounce_display_ms: u64 = 0;
     if screen_forced_off {
@@ -239,7 +243,7 @@ fn main() {
                 last_debounce_display_ms = t;
                 screen_forced_off = !screen_forced_off;
                 lcd.write_backlight(!screen_forced_off);
-                save_screen_forced(&nvs_cache, screen_forced_off);
+                persist.save_screen_forced(screen_forced_off);
             }
         }
         last_btn_display = disp;
@@ -265,7 +269,7 @@ fn main() {
                     last_debounce_display_ms = t;
                     screen_forced_off = !screen_forced_off;
                     lcd.write_backlight(!screen_forced_off);
-                    save_screen_forced(&nvs_cache, screen_forced_off);
+                    persist.save_screen_forced(screen_forced_off);
                 }
             }
             last_btn_display = disp;
@@ -298,6 +302,10 @@ fn main() {
         let mut st = ui_state.lock().unwrap();
         st.wifi_connected = true;
         st.fetching = true; // show hourglass from first render — cleared when fetch completes
+        st.pot_enabled = initial_pot_enabled;
+        if let Some(screen) = persist.load_screen() {
+            st.screen = screen;
+        }
         // Preload last known prices so the ticker shows real data immediately
         // instead of dashes until the first network fetch completes.
         if let Some(cached) = cache::load(&nvs_cache) {
@@ -411,6 +419,7 @@ fn main() {
 
     let mut last_clock_ms:          u64 = loop_start;
     let mut last_auto_screen_ms:    u64 = loop_start;
+    let mut last_lcd_reinit_ms:     u64 = loop_start;
     let mut last_debounce_screen_ms:u64 = 0;
     let mut last_debounce_light_ms: u64 = 0;
     let mut last_loading_ms:      u64 = loop_start;
@@ -421,6 +430,7 @@ fn main() {
 
     let mut last_vol_read_ms: u64 = 0;
     let mut vol_smoothed: u32 = u32::MAX;
+    let mut vol_move_count: u32 = 0;
 
     let mut last_btn_screen = true;
     let mut last_btn_light  = true;
@@ -441,8 +451,8 @@ fn main() {
     let mut history           = history::PriceHistory::new();
     let mut last_history_fetch: u64 = 0;
 
-    let mut prev_lamp_anim  = false;
-    let mut last_backlight  = true;
+    let mut prev_lamp_anim    = false;
+    let mut last_backlight    = true;
 
     loop {
         let now = millis();
@@ -476,6 +486,16 @@ fn main() {
         }
         prev_lamp_anim = lamp_anim_active;
 
+        // ── Periodic LCD re-init — combats contrast drift from thermal effects ──
+        if last_lcd_reinit_ms > 0 && now - last_lcd_reinit_ms >= 30 * 60 * 1000 {
+            last_lcd_reinit_ms = now;
+            lcd.init();
+            let st = ui_state.lock().unwrap();
+            ticker::prime_cgram(&mut lcd, &mut row_cache, &st, now);
+            row_cache.invalidate();
+            ticker::render(&mut lcd, &mut row_cache, &st, now);
+        }
+
         // ── Hourglass animations (skip during chart — CGRAM slots occupied) ──
         let mut anim_header_dirty = false;
         if !chart_active {
@@ -502,7 +522,8 @@ fn main() {
         // ── Clock update every second (skip during chart) ─────────────────────
         if !chart_active && now - last_clock_ms >= 1000 {
             last_clock_ms = now;
-            let st = ui_state.lock().unwrap();
+            let mut st = ui_state.lock().unwrap();
+            st.pot_enabled = POT_ENABLED.load(Ordering::Relaxed);
             ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
         }
 
@@ -525,7 +546,10 @@ fn main() {
                 let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 chart_active = false; // pressing screen button exits chart mode
                 info!("[btn] screen button pressed");
-                if let Ok(mut st) = ui_state.lock() { st.screen = st.screen.next(); }
+                if let Ok(mut st) = ui_state.lock() {
+                    st.screen = st.screen.next();
+                    persist.save_screen(st.screen);
+                }
                 fetch_trigger.store(true, Ordering::Relaxed);
                 row_cache.invalidate();
                 let st = ui_state.lock().unwrap();
@@ -553,7 +577,7 @@ fn main() {
                 }
                 last_lamp_loading_ms = now;
                 // Turning lamp ON clears the screen-off override.
-                if new_on && screen_forced_off { screen_forced_off = false; save_screen_forced(&nvs_cache, false); }
+                if new_on && screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
                 last_loading_ms = now;
                 row_cache.invalidate();
                 let st = ui_state.lock().unwrap();
@@ -569,7 +593,7 @@ fn main() {
                 last_debounce_display_ms = now;
                 let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 screen_forced_off = !screen_forced_off;
-                save_screen_forced(&nvs_cache, screen_forced_off);
+                persist.save_screen_forced(screen_forced_off);
                 info!("[btn] display: {}", if screen_forced_off { "off" } else { "on" });
             }
         }
@@ -583,7 +607,7 @@ fn main() {
                 let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 info!("[btn] warm dim");
                 lamp_handle.queue_warm_dim();
-                if screen_forced_off { screen_forced_off = false; save_screen_forced(&nvs_cache, false); }
+                if screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
                 if let Ok(mut st) = ui_state.lock() {
                     st.lamp.on    = true;
                     st.lamp.known = true;
@@ -606,7 +630,7 @@ fn main() {
                 let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
                 info!("[btn] bright white");
                 lamp_handle.queue_bright_white();
-                if screen_forced_off { screen_forced_off = false; save_screen_forced(&nvs_cache, false); }
+                if screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
                 if let Ok(mut st) = ui_state.lock() {
                     st.lamp.on    = true;
                     st.lamp.known = true;
@@ -621,26 +645,31 @@ fn main() {
         }
         last_btn_bright = bright_btn;
 
-        // ── Chart button (GPIO 16, active LOW) ───────────────────────────────
+        // ── Pot toggle button (GPIO 18, active LOW) — chart code preserved below ──
         let chart_btn = btn_chart.is_high();
         if last_btn_chart && !chart_btn {
             if now - last_debounce_chart_ms >= config::DEBOUNCE_MS {
                 last_debounce_chart_ms = now;
                 let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                if chart_active {
-                    chart_active = false;
-                    row_cache.invalidate();
-                    let st = ui_state.lock().unwrap();
-                    ticker::render(&mut lcd, &mut row_cache, &st, now);
-                } else {
-                    chart_active = true;
-                    chart_until = now + config::CHART_DURATION_MS;
-                    let st = ui_state.lock().unwrap();
-                    let mut prices = [0f64; 60];
-                    let n = history.get(st.screen, &mut prices);
-                    row_cache.invalidate();
-                    chart::render(&mut lcd, &mut row_cache, &st, &prices[..n]);
-                }
+                let enabled = !POT_ENABLED.load(Ordering::Relaxed);
+                POT_ENABLED.store(enabled, Ordering::Relaxed);
+                persist.save_pot_enabled(enabled);
+                let mut st = ui_state.lock().unwrap();
+                st.pot_enabled = enabled;
+                ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
+                // Chart activation code (disabled — preserved for future use):
+                // if chart_active {
+                //     chart_active = false;
+                //     row_cache.invalidate();
+                //     ticker::render(&mut lcd, &mut row_cache, &st, now);
+                // } else {
+                //     chart_active = true;
+                //     chart_until = now + config::CHART_DURATION_MS;
+                //     let mut prices = [0f64; 60];
+                //     let n = history.get(st.screen, &mut prices);
+                //     row_cache.invalidate();
+                //     chart::render(&mut lcd, &mut row_cache, &st, &prices[..n]);
+                // }
             }
         }
         last_btn_chart = chart_btn;
@@ -670,40 +699,44 @@ fn main() {
         // ── Volume potentiometer (GPIO 34, ADC1) ─────────────────────────────
         if now - last_vol_read_ms >= 10 {
             last_vol_read_ms = now;
-            // Median of 5 rapid samples: rejects single-sample spikes and cuts
-            // gaussian noise variance by ~2.2× before anything else touches it.
-            let mut s = [0u32; 5];
+            // 15-sample trimmed mean of middle 7: rejects extreme ADC outliers.
+            let mut s = [0u32; 15];
             for v in s.iter_mut() { *v = vol_pin.read_raw().unwrap_or(0) as u32; }
             s.sort_unstable();
-            let raw = s[2];
-            // Apply sqrt curve in vol×256 fixed-point. Tiny dead zone avoids singularity.
-            let raw_fp: u32 = if raw < 30 {
+            let raw = (s[4] + s[5] + s[6] + s[7] + s[8] + s[9] + s[10]) / 7;
+// Remap pot's actual ADC range to [0, 4095], then sqrt curve → 0-100 output.
+            let raw_cal = raw.clamp(config::POT_ADC_MIN, config::POT_ADC_MAX)
+                .saturating_sub(config::POT_ADC_MIN) * 4095
+                / (config::POT_ADC_MAX - config::POT_ADC_MIN);
+            let raw_fp: u32 = if raw_cal < 10 {
                 0
             } else {
-                ((raw as f32 / 4095.0_f32).sqrt() * 153.0 * 256.0) as u32
+                ((raw_cal as f32 / 4095.0_f32).sqrt() * 153.0 * 256.0) as u32
             };
             if vol_smoothed == u32::MAX { vol_smoothed = raw_fp; }
-            // Per-step clamp: even if 3+ of 5 median samples are corrupted, the output
-            // can move at most 20 vol-units per 10 ms toward the bad value.
-            // Full range (153 units) takes ≥ 77 ms — covers any legitimate fast turn.
-            let clamped_fp = raw_fp.clamp(
-                vol_smoothed.saturating_sub(20 * 256),
-                vol_smoothed + 20 * 256,
-            );
-            // EMA on the clamped median.
-            let error = clamped_fp.abs_diff(vol_smoothed);
-            let alpha: u32 = if error <= 2 * 256 {
-                32   // at rest — heavy smoothing
-            } else if error >= 12 * 256 {
-                256  // clearly moving — instant track
+            let deviation = raw_fp.abs_diff(vol_smoothed);
+            // Freeze-and-track: output is completely frozen when pot is still.
+            // Only 2+ consecutive readings outside the freeze zone trigger tracking,
+            // making single-sample transient spikes invisible to the output.
+            if deviation >= 5 * 256 {
+                vol_move_count = vol_move_count.saturating_add(1);
             } else {
-                32 + (error - 2 * 256) * 224 / (10 * 256)
-            };
-            vol_smoothed = (vol_smoothed * (256 - alpha) + clamped_fp * alpha) / 256;
+                vol_move_count = 0;
+            }
+            if vol_move_count >= 2 {
+                let alpha: u32 = if deviation >= 15 * 256 {
+                    200
+                } else {
+                    80 + (deviation - 5 * 256) * 120 / (10 * 256)
+                };
+                vol_smoothed = (vol_smoothed * (256 - alpha) + raw_fp * alpha) / 256;
+            }
             let vol = (vol_smoothed / 256) as u8;
-            let prev = VOLUME_PCT.load(Ordering::Relaxed);
-            if prev == 255 || (vol as i16 - prev as i16).abs() >= 3 {
-                VOLUME_PCT.store(vol, Ordering::Relaxed);
+            if POT_ENABLED.load(Ordering::Relaxed) {
+                let prev = VOLUME_PCT.load(Ordering::Relaxed);
+                if prev == 255 || (vol as i16 - prev as i16).abs() >= 5 {
+                    VOLUME_PCT.store(vol, Ordering::Relaxed);
+                }
             }
         }
 
@@ -777,6 +810,7 @@ fn main() {
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
 static MIC_UNMUTED: AtomicBool = AtomicBool::new(false);
+static POT_ENABLED: AtomicBool = AtomicBool::new(true);
 
 
 fn spawn_media_server() {
@@ -866,18 +900,3 @@ fn millis() -> u64 {
     (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u64
 }
 
-fn load_screen_forced(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> bool {
-    use esp_idf_svc::nvs::EspNvs;
-    EspNvs::new(nvs.clone(), "disp", true)
-        .ok()
-        .and_then(|mut n| n.get_u8("forced_off").ok().flatten())
-        .map(|v| v != 0)
-        .unwrap_or(false)
-}
-
-fn save_screen_forced(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition, v: bool) {
-    use esp_idf_svc::nvs::EspNvs;
-    if let Ok(mut n) = EspNvs::new(nvs.clone(), "disp", true) {
-        let _ = n.set_u8("forced_off", v as u8);
-    }
-}

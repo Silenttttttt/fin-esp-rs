@@ -128,6 +128,17 @@ pub enum Screen {
 impl Screen {
     pub const COUNT: usize = 5;
 
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Btc),
+            1 => Some(Self::Sol),
+            2 => Some(Self::Gold),
+            3 => Some(Self::Oil),
+            4 => Some(Self::UsdBrl),
+            _ => None,
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Btc => Self::Sol,
