@@ -155,16 +155,17 @@ _mic_q   = queue.Queue()
 _media_q = queue.Queue()
 _lamp_q  = queue.Queue()
 
+# Virtual device that emits XF86AudioMicMute — GNOME's gsd-media-keys picks
+# this up, handles the PA mute, and shows the on-screen OSD automatically.
+_uinput_mic = UInput({ecodes.EV_KEY: [ecodes.KEY_MICMUTE]}, name='mic-key-osd')
+
 def _mic_action(count):
-    global _muted
-    with _state_mutex:
-        _muted = not _muted
-        target = _muted
-    subprocess.Popen(['pactl', 'set-source-mute', _src, '1' if target else '0'],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    logging.info('mic: %s (burst=%d)', 'muted' if target else 'unmuted', count)
-    _esp_event.set()
-    _schedule_resync(0.3)
+    _uinput_mic.write(ecodes.EV_KEY, ecodes.KEY_MICMUTE, 1)
+    _uinput_mic.syn()
+    _uinput_mic.write(ecodes.EV_KEY, ecodes.KEY_MICMUTE, 0)
+    _uinput_mic.syn()
+    logging.info('mic toggle (burst=%d)', count)
+    # _pa_subscriber catches the PA change GNOME makes and syncs ESP32 LED
 
 def _media_action(count):
     subprocess.Popen(['playerctl', 'play-pause'],
@@ -197,63 +198,50 @@ _watched_lock  = threading.Lock()
 def watch_device(dev):
     global _ctrl_count
 
-    # Grab the device and mirror it through UInput so normal typing is unaffected.
-    ui = None
-    try:
-        ui = UInput.from_device(dev, name=f'mic-key-fwd')
-        dev.grab()
-        logging.info('watching %s (%s) [grabbed]', dev.path, dev.name)
-    except Exception as e:
-        if ui:
-            ui.close()
-            ui = None
-        logging.warning('grab failed for %s: %s — events will pass through', dev.path, e)
-        logging.info('watching %s (%s)', dev.path, dev.name)
-
+    logging.info('watching %s (%s)', dev.path, dev.name)
     try:
         for event in dev.read_loop():
-            # ── Ctrl: forward to system AND track locally ─────────────────────
-            if event.type == ecodes.EV_KEY and event.code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL):
+            if event.type != ecodes.EV_KEY:
+                continue
+
+            if event.code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL):
                 with _ctrl_lock:
                     if event.value == 1:
                         _ctrl_count += 1
                     elif event.value == 0:
                         _ctrl_count = max(0, _ctrl_count - 1)
-                # fall through to forward
+                continue
 
-            # ── Consumed action keys: handle and suppress ─────────────────────
-            elif event.type == ecodes.EV_KEY and event.code in _ACTION_KEYS:
-                if event.value == 1:  # keydown
-                    now = time.monotonic()
-                    with _dedup_lock:
-                        if event.code not in _held and now - _last_down.get(event.code, 0) >= 0.05:
-                            _held.add(event.code)
-                            _last_down[event.code] = now
-                            if event.code == ecodes.KEY_PAGEUP:
-                                _mic_q.put(1)
-                            elif event.code == ecodes.KEY_PAGEDOWN:
-                                if _ctrl_held():
-                                    _lamp_q.put(1)
-                                else:
-                                    _media_q.put(1)
-                elif event.value == 0:  # keyup
-                    with _dedup_lock:
-                        _held.discard(event.code)
-                continue  # never forward action key events to applications
+            if event.code not in _ACTION_KEYS:
+                continue
 
-            # ── Everything else: forward unchanged ────────────────────────────
-            if ui:
-                ui.write_event(event)
+            if event.value == 0:
+                with _dedup_lock:
+                    _held.discard(event.code)
+                continue
+            if event.value != 1:
+                continue
+
+            now = time.monotonic()
+            with _dedup_lock:
+                if event.code in _held:
+                    continue
+                if now - _last_down.get(event.code, 0) < 0.3:
+                    continue
+                _held.add(event.code)
+                _last_down[event.code] = now
+
+            if event.code == ecodes.KEY_PAGEUP:
+                _mic_q.put(1)
+            elif event.code == ecodes.KEY_PAGEDOWN:
+                if _ctrl_held():
+                    _lamp_q.put(1)
+                else:
+                    _media_q.put(1)
 
     except Exception as e:
         logging.warning('device %s lost: %s', dev.path, e)
     finally:
-        if ui:
-            try:
-                dev.ungrab()
-            except Exception:
-                pass
-            ui.close()
         with _watched_lock:
             _watched_paths.discard(dev.path)
 
