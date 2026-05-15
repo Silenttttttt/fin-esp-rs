@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Evdev key daemon — handles bare Insert on GNOME/Wayland (can't be grabbed as a
-custom shortcut). Runs as a user service. Requires 'input' group membership.
+Evdev key daemon — handles keys on GNOME/Wayland (can't be grabbed as
+custom shortcuts). Runs as a user service. Requires 'input' group membership.
 
 Keys handled:
-  Insert → mic toggle (pactl + ESP32 LED)
+  PgUp          → mic toggle (pactl + ESP32 LED)
+  PgDn          → play/pause (playerctl)
+  Ctrl + PgDn   → lamp toggle (ESP32)
 
 LED always reflects actual PulseAudio mic state — external changes (VM, GNOME,
 other tools) are picked up via `pactl subscribe` and synced automatically.
@@ -23,13 +25,23 @@ from evdev import ecodes
 ESP_IP   = os.environ.get('ESP_IP', '192.168.1.240')
 ESP_PORT = 9877
 
-WATCHED_KEYS = {ecodes.KEY_INSERT}
+# Keys that trigger deduped single-fire actions; Ctrl keys tracked separately.
+_ACTION_KEYS = {ecodes.KEY_PAGEUP, ecodes.KEY_PAGEDOWN}
+WATCHED_KEYS = _ACTION_KEYS | {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
     stream=sys.stdout,
 )
+
+# ── Ctrl held tracker ──────────────────────────────────────────────────────────
+_ctrl_count = 0
+_ctrl_lock  = threading.Lock()
+
+def _ctrl_held() -> bool:
+    with _ctrl_lock:
+        return _ctrl_count > 0
 
 # ── Mic state ──────────────────────────────────────────────────────────────────
 _src   = subprocess.check_output(['pactl', 'get-default-source']).decode().strip()
@@ -72,7 +84,6 @@ _resync_timer: 'threading.Timer | None' = None
 _resync_timer_lock = threading.Lock()
 
 def _schedule_resync(delay: float = 0.3):
-    """After a key action, verify actual PA state matches _muted and correct if not."""
     global _resync_timer
     with _resync_timer_lock:
         if _resync_timer is not None:
@@ -91,14 +102,11 @@ def _do_resync():
     _esp_event.set()
 
 threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
-
-# Sync LED to actual state at startup
 _esp_event.set()
 logging.info('startup: %s', 'muted' if _muted else 'unmuted')
 
 # ── PulseAudio subscriber — catches external mute changes ─────────────────────
 def _pa_subscriber():
-    """Stream pactl events; sync LED whenever mic state changes from any source."""
     global _muted
     while True:
         try:
@@ -138,7 +146,10 @@ def _burst_worker(q, action):
             continue
         action(count)
 
-_mic_q = queue.Queue()
+# ── Actions ───────────────────────────────────────────────────────────────────
+_mic_q   = queue.Queue()
+_media_q = queue.Queue()
+_lamp_q  = queue.Queue()
 
 def _mic_action(count):
     global _muted
@@ -147,36 +158,65 @@ def _mic_action(count):
         target = _muted
     subprocess.Popen(['pactl', 'set-source-mute', _src, '1' if target else '0'],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    logging.info('%s (burst=%d)', 'muted' if target else 'unmuted', count)
+    logging.info('mic: %s (burst=%d)', 'muted' if target else 'unmuted', count)
     _esp_event.set()
     _schedule_resync(0.3)
 
-threading.Thread(target=_burst_worker, args=(_mic_q, _mic_action), daemon=True, name='mic-worker').start()
+def _media_action(count):
+    subprocess.Popen(['playerctl', 'play-pause'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    logging.info('playerctl play-pause (burst=%d)', count)
 
-_key_queue = {
-    ecodes.KEY_INSERT: _mic_q,
-}
+def _lamp_action(count):
+    for attempt in range(3):
+        try:
+            s = socket.create_connection((ESP_IP, ESP_PORT), timeout=3)
+            s.sendall(b'l:t\n')
+            s.close()
+            logging.info('ESP32 <- l:t (lamp toggle)')
+            break
+        except Exception as e:
+            logging.warning('lamp send failed (attempt %d): %s', attempt + 1, e)
+            time.sleep(1)
+
+for _q, _fn in [(_mic_q, _mic_action), (_media_q, _media_action), (_lamp_q, _lamp_action)]:
+    threading.Thread(target=_burst_worker, args=(_q, _fn), daemon=True).start()
 
 # ── evdev listener ────────────────────────────────────────────────────────────
-_held      = set()
+_held       = set()
 _last_down: dict[int, float] = {}
 _dedup_lock = threading.Lock()
 
 _watched_paths: set[str] = set()
-_watched_lock = threading.Lock()
+_watched_lock  = threading.Lock()
 
 def watch_device(dev):
+    global _ctrl_count
     logging.info('watching %s (%s)', dev.path, dev.name)
     try:
         for event in dev.read_loop():
-            if event.type != ecodes.EV_KEY or event.code not in _key_queue:
+            if event.type != ecodes.EV_KEY:
                 continue
+
+            # Track Ctrl state across all up/down transitions (not deduped).
+            if event.code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL):
+                with _ctrl_lock:
+                    if event.value == 1:
+                        _ctrl_count += 1
+                    elif event.value == 0:
+                        _ctrl_count = max(0, _ctrl_count - 1)
+                continue
+
+            if event.code not in _ACTION_KEYS:
+                continue
+
             if event.value == 0:
                 with _dedup_lock:
                     _held.discard(event.code)
                 continue
             if event.value != 1:
                 continue
+
             now = time.monotonic()
             with _dedup_lock:
                 if event.code in _held:
@@ -185,7 +225,15 @@ def watch_device(dev):
                     continue
                 _held.add(event.code)
                 _last_down[event.code] = now
-            _key_queue[event.code].put(1)
+
+            if event.code == ecodes.KEY_PAGEUP:
+                _mic_q.put(1)
+            elif event.code == ecodes.KEY_PAGEDOWN:
+                if _ctrl_held():
+                    _lamp_q.put(1)
+                else:
+                    _media_q.put(1)
+
     except Exception as e:
         logging.warning('device %s lost: %s', dev.path, e)
     finally:
@@ -200,7 +248,7 @@ def find_keyboards():
             if 'Consumer Control' in d.name:
                 continue
             caps = d.capabilities()
-            if ecodes.EV_KEY in caps and any(k in caps[ecodes.EV_KEY] for k in WATCHED_KEYS):
+            if ecodes.EV_KEY in caps and any(k in caps[ecodes.EV_KEY] for k in _ACTION_KEYS):
                 devs.append(d)
         except Exception:
             pass
@@ -211,8 +259,7 @@ def _start_watching(dev):
         if dev.path in _watched_paths:
             return
         _watched_paths.add(dev.path)
-    t = threading.Thread(target=watch_device, args=(dev,), daemon=True)
-    t.start()
+    threading.Thread(target=watch_device, args=(dev,), daemon=True).start()
 
 def _scanner():
     while True:

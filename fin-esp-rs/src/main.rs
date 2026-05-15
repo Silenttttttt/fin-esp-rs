@@ -291,12 +291,13 @@ fn main() {
 
     // Media server — laptop connects here and receives "p\n" on button press.
     spawn_media_server();
-    // Mic LED server — any machine connects briefly to send "m:0\n" or "m:1\n".
-    spawn_mic_server();
 
     // Shared state
     let ui_state   = Arc::new(Mutex::new(screen::UiState::default()));
     let lamp_handle = Arc::new(tuya::LampHandle::new());
+
+    // Mic/lamp server — accepts "m:0", "m:1" (mic LED), "l:t" (lamp toggle).
+    spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state));
 
     {
         let mut st = ui_state.lock().unwrap();
@@ -861,11 +862,11 @@ fn spawn_media_server() {
         .ok();
 }
 
-fn spawn_mic_server() {
+fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<screen::UiState>>) {
     std::thread::Builder::new()
         .name("mic-srv".into())
         .stack_size(6144)
-        .spawn(|| {
+        .spawn(move || {
             use std::net::TcpListener;
             loop {
                 let listener = match TcpListener::bind("0.0.0.0:9877") {
@@ -882,6 +883,17 @@ fn spawn_mic_server() {
                                 match line.trim() {
                                     "m:1" => { MIC_UNMUTED.store(true,  Ordering::Relaxed); info!("[mic] unmuted"); }
                                     "m:0" => { MIC_UNMUTED.store(false, Ordering::Relaxed); info!("[mic] muted");   }
+                                    "l:t" => {
+                                        let new_on = {
+                                            let st = ui_state.lock().unwrap();
+                                            lamp_handle.flip_target(st.lamp.on)
+                                        };
+                                        if let Ok(mut st) = ui_state.lock() {
+                                            st.lamp.on    = new_on;
+                                            st.lamp.known = true;
+                                        }
+                                        info!("[lamp] toggled via laptop -> {}", if new_on { "on" } else { "off" });
+                                    }
                                     _ => {}
                                 }
                             }
