@@ -115,6 +115,10 @@ pub const TUYA_DEVICE_IP:  [u8; 4]  = ip_from_env();
 pub const TUYA_DEVICE_PORT: u16 = 6668;
 pub const TUYA_PROTOCOL_VERSION: u8 = 5; // 3.5
 
+// Web control server — browse to http://<ESP_IP> when enabled
+// Set WEB_SERVER=1 in .env to enable; omit or set to empty to disable.
+pub const WEB_SERVER_ENABLED: bool = option_env!("WEB_SERVER").is_some();
+
 // Screen identifiers
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {

@@ -13,6 +13,7 @@ mod sand;
 mod screen;
 mod ticker;
 mod tuya;
+mod web;
 
 use esp_idf_hal::adc::attenuation;
 use esp_idf_hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
@@ -151,12 +152,13 @@ fn main() {
     let persist = persist::Persist::new(nvs_cache.clone());
 
     // Load persisted state before the sand animation starts.
-    let mut screen_forced_off = persist.load_screen_forced();
+    let screen_forced_off = Arc::new(AtomicBool::new(persist.load_screen_forced()));
     let initial_pot_enabled   = persist.load_pot_enabled();
     POT_ENABLED.store(initial_pot_enabled, Ordering::Relaxed);
+    let web_triggers = Arc::new(web::WebTriggers::new());
     let mut last_btn_display:       bool = true;
     let mut last_debounce_display_ms: u64 = 0;
-    if screen_forced_off {
+    if screen_forced_off.load(Ordering::Relaxed) {
         lcd.write_backlight(false);
         led_green.set_low().unwrap();
         led_red.set_low().unwrap();
@@ -241,14 +243,15 @@ fn main() {
             let t = millis();
             if t - last_debounce_display_ms >= config::DEBOUNCE_MS {
                 last_debounce_display_ms = t;
-                screen_forced_off = !screen_forced_off;
-                lcd.write_backlight(!screen_forced_off);
-                persist.save_screen_forced(screen_forced_off);
+                let sfo = !screen_forced_off.load(Ordering::Relaxed);
+                screen_forced_off.store(sfo, Ordering::Relaxed);
+                lcd.write_backlight(!sfo);
+                persist.save_screen_forced(sfo);
             }
         }
         last_btn_display = disp;
 
-        if !screen_forced_off {
+        if !screen_forced_off.load(Ordering::Relaxed) {
             for _ in 0..2 { sand.step(); }
             sand.render(&mut lcd, SAND_COL);
         }
@@ -267,13 +270,14 @@ fn main() {
                 let t = millis();
                 if t - last_debounce_display_ms >= config::DEBOUNCE_MS {
                     last_debounce_display_ms = t;
-                    screen_forced_off = !screen_forced_off;
-                    lcd.write_backlight(!screen_forced_off);
-                    persist.save_screen_forced(screen_forced_off);
+                    let sfo = !screen_forced_off.load(Ordering::Relaxed);
+                    screen_forced_off.store(sfo, Ordering::Relaxed);
+                    lcd.write_backlight(!sfo);
+                    persist.save_screen_forced(sfo);
                 }
             }
             last_btn_display = disp;
-            if !screen_forced_off {
+            if !screen_forced_off.load(Ordering::Relaxed) {
                 for _ in 0..5 { sand.step(); }
                 sand.render(&mut lcd, SAND_COL);
             }
@@ -298,6 +302,11 @@ fn main() {
 
     // Mic/lamp server — accepts "m:0", "m:1" (mic LED), "l:t" (lamp toggle).
     spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state));
+
+    // Web control server — browse to http://<ESP_IP>
+    if config::WEB_SERVER_ENABLED {
+        web::spawn(Arc::clone(&web_triggers), Arc::clone(&ui_state), Arc::clone(&screen_forced_off));
+    }
 
     {
         let mut st = ui_state.lock().unwrap();
@@ -540,152 +549,138 @@ fn main() {
 
         // ── Screen button (GPIO 26, active LOW) ──────────────────────────────
         let btn = btn_screen.is_high();
-        if last_btn_screen && !btn {
-            if now - last_debounce_screen_ms >= config::DEBOUNCE_MS {
-                last_debounce_screen_ms = now;
-                last_auto_screen_ms     = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                chart_active = false; // pressing screen button exits chart mode
-                info!("[btn] screen button pressed");
-                if let Ok(mut st) = ui_state.lock() {
-                    st.screen = st.screen.next();
-                    persist.save_screen(st.screen);
-                }
-                fetch_trigger.store(true, Ordering::Relaxed);
-                row_cache.invalidate();
-                let st = ui_state.lock().unwrap();
-                ticker::render(&mut lcd, &mut row_cache, &st, now);
+        let phys_screen = last_btn_screen && !btn && now - last_debounce_screen_ms >= config::DEBOUNCE_MS;
+        let web_screen  = config::WEB_SERVER_ENABLED && web_triggers.screen.swap(false, Ordering::Relaxed);
+        if phys_screen || web_screen {
+            last_debounce_screen_ms = now;
+            last_auto_screen_ms     = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            chart_active = false;
+            info!("[btn] screen {}", if web_screen { "web" } else { "physical" });
+            if let Ok(mut st) = ui_state.lock() {
+                st.screen = st.screen.next();
+                persist.save_screen(st.screen);
             }
+            fetch_trigger.store(true, Ordering::Relaxed);
+            row_cache.invalidate();
+            let st = ui_state.lock().unwrap();
+            ticker::render(&mut lcd, &mut row_cache, &st, now);
         }
         last_btn_screen = btn;
 
         // ── Light button (GPIO 12, active LOW, pull-up) ──────────────────────
         let light = btn_light.is_high();
-        if last_btn_light && !light {
-            if now - last_debounce_light_ms >= config::DEBOUNCE_MS {
-                last_debounce_light_ms = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                info!("[btn] light button pressed");
-                let (new_on, wifi_conn) = {
-                    let st = ui_state.lock().unwrap();
-                    (lamp_handle.flip_target(st.lamp.on), st.wifi_connected)
-                };
-                if let Ok(mut st) = ui_state.lock() {
-                    st.lamp.on    = new_on;
-                    st.lamp.known = true;
-                    st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
-                    st.lamp_loading_frame = 0;
-                }
-                last_lamp_loading_ms = now;
-                // Turning lamp ON clears the screen-off override.
-                if new_on && screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
-                last_loading_ms = now;
-                row_cache.invalidate();
+        let phys_lamp = last_btn_light && !light && now - last_debounce_light_ms >= config::DEBOUNCE_MS;
+        let web_lamp  = config::WEB_SERVER_ENABLED && web_triggers.lamp.swap(false, Ordering::Relaxed);
+        if phys_lamp || web_lamp {
+            last_debounce_light_ms = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            info!("[btn] lamp {}", if web_lamp { "web" } else { "physical" });
+            let new_on = {
                 let st = ui_state.lock().unwrap();
-                ticker::render(&mut lcd, &mut row_cache, &st, now);
+                lamp_handle.flip_target(st.lamp.on)
+            };
+            if let Ok(mut st) = ui_state.lock() {
+                st.lamp.on    = new_on;
+                st.lamp.known = true;
+                st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
+                st.lamp_loading_frame = 0;
             }
+            last_lamp_loading_ms = now;
+            if new_on && screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
+            last_loading_ms = now;
+            row_cache.invalidate();
+            let st = ui_state.lock().unwrap();
+            ticker::render(&mut lcd, &mut row_cache, &st, now);
         }
         last_btn_light = light;
 
         // ── Display power button (GPIO 32, active LOW, pull-up) ──────────────
         let disp_btn = btn_display.is_high();
-        if last_btn_display && !disp_btn {
-            if now - last_debounce_display_ms >= config::DEBOUNCE_MS {
-                last_debounce_display_ms = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                screen_forced_off = !screen_forced_off;
-                persist.save_screen_forced(screen_forced_off);
-                info!("[btn] display: {}", if screen_forced_off { "off" } else { "on" });
-            }
+        let phys_display = last_btn_display && !disp_btn && now - last_debounce_display_ms >= config::DEBOUNCE_MS;
+        let web_display  = config::WEB_SERVER_ENABLED && web_triggers.display.swap(false, Ordering::Relaxed);
+        if phys_display || web_display {
+            last_debounce_display_ms = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let sfo = !screen_forced_off.load(Ordering::Relaxed);
+            screen_forced_off.store(sfo, Ordering::Relaxed);
+            persist.save_screen_forced(sfo);
+            info!("[btn] display {} ({})", if sfo { "off" } else { "on" }, if web_display { "web" } else { "physical" });
         }
         last_btn_display = disp_btn;
 
         // ── Warm dim button (GPIO 4, active LOW) ─────────────────────────────
         let warm_btn = btn_warm.is_high();
-        if last_btn_warm && !warm_btn {
-            if now - last_debounce_warm_ms >= config::DEBOUNCE_MS {
-                last_debounce_warm_ms = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                info!("[btn] warm dim");
-                lamp_handle.queue_warm_dim();
-                if screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
-                if let Ok(mut st) = ui_state.lock() {
-                    st.lamp.on    = true;
-                    st.lamp.known = true;
-                    st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
-                    st.lamp_loading_frame = 0;
-                }
-                last_lamp_loading_ms = now;
-                row_cache.invalidate();
-                let st = ui_state.lock().unwrap();
-                ticker::render(&mut lcd, &mut row_cache, &st, now);
+        let phys_warm = last_btn_warm && !warm_btn && now - last_debounce_warm_ms >= config::DEBOUNCE_MS;
+        let web_warm  = config::WEB_SERVER_ENABLED && web_triggers.warm.swap(false, Ordering::Relaxed);
+        if phys_warm || web_warm {
+            last_debounce_warm_ms = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            info!("[btn] warm dim ({})", if web_warm { "web" } else { "physical" });
+            lamp_handle.queue_warm_dim();
+            if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
+            if let Ok(mut st) = ui_state.lock() {
+                st.lamp.on    = true;
+                st.lamp.known = true;
+                st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
+                st.lamp_loading_frame = 0;
             }
+            last_lamp_loading_ms = now;
+            row_cache.invalidate();
+            let st = ui_state.lock().unwrap();
+            ticker::render(&mut lcd, &mut row_cache, &st, now);
         }
         last_btn_warm = warm_btn;
 
         // ── Bright white button (GPIO 5, active LOW) ─────────────────────────
         let bright_btn = btn_bright.is_high();
-        if last_btn_bright && !bright_btn {
-            if now - last_debounce_bright_ms >= config::DEBOUNCE_MS {
-                last_debounce_bright_ms = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                info!("[btn] bright white");
-                lamp_handle.queue_bright_white();
-                if screen_forced_off { screen_forced_off = false; persist.save_screen_forced(false); }
-                if let Ok(mut st) = ui_state.lock() {
-                    st.lamp.on    = true;
-                    st.lamp.known = true;
-                    st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
-                    st.lamp_loading_frame = 0;
-                }
-                last_lamp_loading_ms = now;
-                row_cache.invalidate();
-                let st = ui_state.lock().unwrap();
-                ticker::render(&mut lcd, &mut row_cache, &st, now);
+        let phys_bright = last_btn_bright && !bright_btn && now - last_debounce_bright_ms >= config::DEBOUNCE_MS;
+        let web_bright  = config::WEB_SERVER_ENABLED && web_triggers.bright.swap(false, Ordering::Relaxed);
+        if phys_bright || web_bright {
+            last_debounce_bright_ms = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            info!("[btn] bright white ({})", if web_bright { "web" } else { "physical" });
+            lamp_handle.queue_bright_white();
+            if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
+            if let Ok(mut st) = ui_state.lock() {
+                st.lamp.on    = true;
+                st.lamp.known = true;
+                st.lamp_anim_until    = now + config::LAMP_TOGGLE_ANIM_MS;
+                st.lamp_loading_frame = 0;
             }
+            last_lamp_loading_ms = now;
+            row_cache.invalidate();
+            let st = ui_state.lock().unwrap();
+            ticker::render(&mut lcd, &mut row_cache, &st, now);
         }
         last_btn_bright = bright_btn;
 
         // ── Pot toggle button (GPIO 18, active LOW) — chart code preserved below ──
         let chart_btn = btn_chart.is_high();
-        if last_btn_chart && !chart_btn {
-            if now - last_debounce_chart_ms >= config::DEBOUNCE_MS {
-                last_debounce_chart_ms = now;
-                let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-                let enabled = !POT_ENABLED.load(Ordering::Relaxed);
-                POT_ENABLED.store(enabled, Ordering::Relaxed);
-                persist.save_pot_enabled(enabled);
-                let mut st = ui_state.lock().unwrap();
-                st.pot_enabled = enabled;
-                ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
-                // Chart activation code (disabled — preserved for future use):
-                // if chart_active {
-                //     chart_active = false;
-                //     row_cache.invalidate();
-                //     ticker::render(&mut lcd, &mut row_cache, &st, now);
-                // } else {
-                //     chart_active = true;
-                //     chart_until = now + config::CHART_DURATION_MS;
-                //     let mut prices = [0f64; 60];
-                //     let n = history.get(st.screen, &mut prices);
-                //     row_cache.invalidate();
-                //     chart::render(&mut lcd, &mut row_cache, &st, &prices[..n]);
-                // }
-            }
+        let phys_pot = last_btn_chart && !chart_btn && now - last_debounce_chart_ms >= config::DEBOUNCE_MS;
+        let web_pot  = config::WEB_SERVER_ENABLED && web_triggers.pot.swap(false, Ordering::Relaxed);
+        if phys_pot || web_pot {
+            last_debounce_chart_ms = now;
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let enabled = !POT_ENABLED.load(Ordering::Relaxed);
+            POT_ENABLED.store(enabled, Ordering::Relaxed);
+            persist.save_pot_enabled(enabled);
+            let mut st = ui_state.lock().unwrap();
+            st.pot_enabled = enabled;
+            info!("[btn] pot {} ({})", if enabled { "on" } else { "off" }, if web_pot { "web" } else { "physical" });
+            ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
         }
         last_btn_chart = chart_btn;
 
         // ── Media play/pause button (GPIO 19, active LOW) ────────────────────
         let media_btn = btn_media.is_high();
-        if last_btn_media && !media_btn {
-            if now - last_debounce_media_ms >= config::DEBOUNCE_MS {
-                last_debounce_media_ms = now;
-                info!("[btn] media play/pause");
-                let _ = led_red.set_high();
-                FreeRtos::delay_ms(80);
-                let _ = led_red.set_low();
-                PLAY_PAUSE_READY.store(true, Ordering::Relaxed);
-            }
+        let phys_media = last_btn_media && !media_btn && now - last_debounce_media_ms >= config::DEBOUNCE_MS;
+        let web_media  = config::WEB_SERVER_ENABLED && web_triggers.media.swap(false, Ordering::Relaxed);
+        if phys_media || web_media {
+            last_debounce_media_ms = now;
+            info!("[btn] media play/pause ({})", if web_media { "web" } else { "physical" });
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            PLAY_PAUSE_READY.store(true, Ordering::Relaxed);
         }
         last_btn_media = media_btn;
 
@@ -756,7 +751,7 @@ fn main() {
                 true
             }
         };
-        let want_backlight = !screen_forced_off && (is_day || !lamp_known_off);
+        let want_backlight = !screen_forced_off.load(Ordering::Relaxed) && (is_day || !lamp_known_off);
         if want_backlight != last_backlight { last_backlight = want_backlight; lcd.write_backlight(want_backlight); }
         // LEDs always written directly — no dirty tracking to avoid init-state bugs.
         // Coupled to want_backlight so LEDs and backlight are always in sync.
@@ -800,7 +795,7 @@ fn main() {
                 btn_screen.is_high() as u8,
                 btn_light.is_high() as u8,
                 btn_display.is_high() as u8,
-                screen_forced_off as u8);
+                screen_forced_off.load(Ordering::Relaxed) as u8);
         }
 
         unsafe { let _ = esp_idf_sys::esp_task_wdt_reset(); }
