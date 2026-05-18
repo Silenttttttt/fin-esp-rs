@@ -110,8 +110,7 @@ fn handle(
     screen_forced_off: &Arc<AtomicBool>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let read_clone = match stream.try_clone() { Ok(s) => s, Err(_) => return };
-    let mut reader = BufReader::new(read_clone);
+    let mut reader = BufReader::new(stream);
 
     let mut first_line = String::new();
     if reader.read_line(&mut first_line).is_err() { return; }
@@ -119,7 +118,7 @@ fn handle(
 
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 { return; }
-    let mut s = stream;
+    let mut s = reader.into_inner();
 
     match (parts[0], parts[1]) {
         ("GET", "/") => {
