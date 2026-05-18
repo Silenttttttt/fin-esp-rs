@@ -6,6 +6,9 @@ use log::warn;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// 255 = unknown (never set by web)
+pub const LAMP_UNKNOWN: u32 = 255;
+
 use crate::config;
 
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +38,15 @@ pub struct LampHandle {
     // Persistent TCP session — reused across polls and refreshes.
     // Set to None on any I/O failure; reconnected lazily on next use.
     sess: Mutex<Option<session::Session>>,
+
+    // Custom brightness/temp for target==4 (web-set values, Tuya range).
+    custom_brightness: AtomicU32, // 10–1000
+    custom_temp:       AtomicU32, // 0–1000
+
+    // Last successfully applied values; reported via web /status.
+    // LAMP_UNKNOWN = never applied.
+    pub last_brightness: AtomicU32,
+    pub last_temp:       AtomicU32,
 }
 
 impl LampHandle {
@@ -49,6 +61,10 @@ impl LampHandle {
             suppress_until_ms: AtomicU32::new(0),
             retry_after_ms:    AtomicU32::new(0),
             sess:              Mutex::new(None),
+            custom_brightness: AtomicU32::new(500),
+            custom_temp:       AtomicU32::new(500),
+            last_brightness:   AtomicU32::new(LAMP_UNKNOWN),
+            last_temp:         AtomicU32::new(LAMP_UNKNOWN),
         }
     }
 
@@ -124,6 +140,18 @@ impl LampHandle {
         want_on
     }
 
+    pub fn queue_on(&self) {
+        *self.target.lock().unwrap() = 1;
+        self.retry_after_ms.store(0, Ordering::Relaxed);
+        self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+    }
+
+    pub fn queue_off(&self) {
+        *self.target.lock().unwrap() = -1;
+        self.retry_after_ms.store(0, Ordering::Relaxed);
+        self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+    }
+
     pub fn queue_warm_dim(&self) {
         *self.target.lock().unwrap() = 2;
         self.retry_after_ms.store(0, Ordering::Relaxed);
@@ -136,9 +164,27 @@ impl LampHandle {
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
     }
 
-    pub fn apply_brightness(&self, level: u16) -> bool {
-        let dps = std::format!(r#""22":{}"#, level.clamp(10, 1000));
-        self.do_send_dps(&dps).is_some()
+    /// Set brightness (10–1000 Tuya) and color temperature (0=warm … 1000=cool).
+    pub fn queue_brightness_temp(&self, brightness: u16, temp: u16) {
+        self.custom_brightness.store(brightness.clamp(10, 1000) as u32, Ordering::Relaxed);
+        self.custom_temp.store(temp.clamp(0, 1000) as u32, Ordering::Relaxed);
+        *self.target.lock().unwrap() = 4;
+        self.retry_after_ms.store(0, Ordering::Relaxed);
+        self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+    }
+
+    /// Last applied brightness as 0–100 percentage (LAMP_UNKNOWN if never set).
+    pub fn brightness_pct(&self) -> u32 {
+        let b = self.last_brightness.load(Ordering::Relaxed);
+        if b == LAMP_UNKNOWN { return LAMP_UNKNOWN; }
+        (b.saturating_sub(10)) * 100 / 990
+    }
+
+    /// Last applied color temp as 0–100 (0=warm, 100=cool; LAMP_UNKNOWN if never set).
+    pub fn temp_pct(&self) -> u32 {
+        let t = self.last_temp.load(Ordering::Relaxed);
+        if t == LAMP_UNKNOWN { return LAMP_UNKNOWN; }
+        t * 100 / 1000
     }
 
     /// Execute any pending target command. Returns true when state changes.
@@ -155,8 +201,23 @@ impl LampHandle {
         let result: Option<bool> = match target {
              1 => self.do_send_dps(r#""20":true"#).map(|_| true),
             -1 => self.do_send_dps(r#""20":false"#).map(|_| false),
-             2 => self.do_send_dps(r#""20":true,"21":"white","22":10,"23":0"#).map(|_| true),
-             3 => self.do_send_dps(r#""20":true,"21":"white","22":1000,"23":1000"#).map(|_| true),
+             2 => self.do_send_dps(r#""20":true,"21":"white","22":10,"23":0"#).inspect(|_| {
+                    self.last_brightness.store(10, Ordering::Relaxed);
+                    self.last_temp.store(0, Ordering::Relaxed);
+                 }).map(|_| true),
+             3 => self.do_send_dps(r#""20":true,"21":"white","22":1000,"23":1000"#).inspect(|_| {
+                    self.last_brightness.store(1000, Ordering::Relaxed);
+                    self.last_temp.store(1000, Ordering::Relaxed);
+                 }).map(|_| true),
+             4 => {
+                let b = self.custom_brightness.load(Ordering::Relaxed).clamp(10, 1000);
+                let t = self.custom_temp.load(Ordering::Relaxed).clamp(0, 1000);
+                let dps = std::format!(r#""20":true,"21":"white","22":{},"23":{}"#, b, t);
+                self.do_send_dps(&dps).inspect(|_| {
+                    self.last_brightness.store(b, Ordering::Relaxed);
+                    self.last_temp.store(t, Ordering::Relaxed);
+                }).map(|_| true)
+             }
              _ => return false,
         };
 
