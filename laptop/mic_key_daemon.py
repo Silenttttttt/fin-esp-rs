@@ -19,6 +19,9 @@ import time
 ESP_IP   = os.environ.get('ESP_IP', '192.168.1.240')
 ESP_PORT = 9877
 
+# Kill and restart pactl subscribe if no events arrive within this many seconds.
+PA_WATCHDOG_SECS = 600
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
@@ -62,15 +65,23 @@ def _esp_sender():
                 time.sleep(1)
 
 # ── PulseAudio subscriber — catches all mic state changes ─────────────────────
+_last_pa_event = time.time()   # updated on every line from pactl subscribe
+_pa_proc_lock  = threading.Lock()
+_pa_proc       = None          # current pactl subscribe Popen object
+
 def _pa_subscriber():
-    global _muted
+    global _muted, _pa_proc, _last_pa_event
     while True:
         try:
             proc = subprocess.Popen(
                 ['pactl', 'subscribe'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             )
+            with _pa_proc_lock:
+                _pa_proc = proc
+            _last_pa_event = time.time()
             for line in proc.stdout:
+                _last_pa_event = time.time()
                 if 'source' not in line or 'change' not in line:
                     continue
                 time.sleep(0.05)  # let PulseAudio settle the change
@@ -83,11 +94,26 @@ def _pa_subscriber():
                 _esp_event.set()
         except Exception as e:
             logging.warning('pactl subscribe error: %s — restarting', e)
-            time.sleep(2)
+        finally:
+            with _pa_proc_lock:
+                _pa_proc = None
+        time.sleep(2)
+
+# ── Watchdog — restarts pactl subscribe if it goes stale ──────────────────────
+def _watchdog():
+    while True:
+        time.sleep(60)
+        if time.time() - _last_pa_event > PA_WATCHDOG_SECS:
+            with _pa_proc_lock:
+                proc = _pa_proc
+            if proc is not None:
+                logging.warning('pactl subscribe stale (>%ds) — restarting', PA_WATCHDOG_SECS)
+                proc.kill()
 
 if __name__ == '__main__':
-    threading.Thread(target=_esp_sender, daemon=True, name='esp-sender').start()
+    threading.Thread(target=_esp_sender,   daemon=True, name='esp-sender').start()
     threading.Thread(target=_pa_subscriber, daemon=True, name='pa-sub').start()
+    threading.Thread(target=_watchdog,      daemon=True, name='watchdog').start()
     _esp_event.set()
     logging.info('startup: %s', 'muted' if _muted else 'unmuted')
     while True:

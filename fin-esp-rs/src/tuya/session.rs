@@ -33,7 +33,7 @@ impl Session {
         )
         .map_err(|e| format!("TCP connect: {e}"))?;
 
-        stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
+        stream.set_read_timeout(Some(Duration::from_millis(600))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
 
         info!("[tuya] TCP connected");
@@ -105,8 +105,8 @@ impl Session {
             r#"{{"protocol":5,"t":{},"data":{{"dps":{{{}}}}}}}"#,
             ts, dps_json
         );
+        info!("[tuya] tx dps: {}", &json[..json.len().min(120)]);
 
-        // Protocol 3.5 DPS payloads are prefixed with the version string "3.5" + 12 null bytes.
         let mut payload = Vec::with_capacity(15 + json.len());
         payload.extend_from_slice(b"3.5\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
         payload.extend_from_slice(json.as_bytes());
@@ -115,8 +115,17 @@ impl Session {
             return false;
         }
 
-        let _ = self.receive_raw();
-        let _ = self.receive_raw();
+        for i in 0..2 {
+            match self.receive_raw() {
+                Some(r) => {
+                    info!("[tuya] dps rx[{}] {} bytes: {:02x?}", i, r.len(), &r[..r.len().min(48)]);
+                    if let Some((_cmd, resp)) = protocol::parse_response(&r, &self.session_key) {
+                        info!("[tuya] dps resp[{}]: {}", i, &resp[..resp.len().min(120)]);
+                    }
+                }
+                None => info!("[tuya] dps rx[{}]: timeout", i),
+            }
+        }
 
         true
     }
@@ -259,7 +268,7 @@ impl Session {
         }
 
         self.stream
-            .set_read_timeout(Some(Duration::from_secs(4)))
+            .set_read_timeout(Some(Duration::from_millis(600)))
             .ok();
 
         if total.is_empty() {

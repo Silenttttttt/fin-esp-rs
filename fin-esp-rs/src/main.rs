@@ -7,6 +7,7 @@ mod fmt;
 mod glyphs;
 mod history;
 mod lcd;
+mod led;
 mod ota;
 mod persist;
 mod sand;
@@ -299,15 +300,19 @@ fn main() {
     // Shared state
     let ui_state   = Arc::new(Mutex::new(screen::UiState::default()));
     let lamp_handle = Arc::new(tuya::LampHandle::new());
+    let led_state   = Arc::new(led::LedState::new());
+
+    // Set initial LED state now that wifi is connected.
+    led_state.on_wifi_connect(!screen_forced_off.load(Ordering::Relaxed));
 
     // Mic/lamp server — accepts "m:0", "m:1" (mic LED), "l:t" (lamp toggle).
-    spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state));
+    spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state), Arc::clone(&led_state));
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 
     // Web control server — browse to http://<ESP_IP>
     if config::WEB_SERVER_ENABLED {
-        web::spawn(Arc::clone(&web_triggers), Arc::clone(&ui_state), Arc::clone(&screen_forced_off), Arc::clone(&lamp_handle), Arc::clone(&auto_rotate));
+        web::spawn(Arc::clone(&web_triggers), Arc::clone(&ui_state), Arc::clone(&screen_forced_off), Arc::clone(&lamp_handle), Arc::clone(&auto_rotate), Arc::clone(&led_state));
     }
 
     {
@@ -466,6 +471,11 @@ fn main() {
     let mut prev_lamp_anim    = false;
     let mut last_backlight    = true;
 
+    // Track last value written to each LED pin so hardware is only touched on change.
+    let mut last_hw_green = false;
+    let mut last_hw_red   = true;  // matches boot: red=high until wifi connects
+    let mut last_hw_blue  = false;
+
     loop {
         let now = millis();
 
@@ -531,11 +541,20 @@ fn main() {
             }
         }
 
+        // ── Web volume trigger ────────────────────────────────────────────────
+        let web_vol_raw = if config::WEB_SERVER_ENABLED { web_triggers.volume.swap(-1, Ordering::Relaxed) } else { -1i8 };
+        if web_vol_raw >= 0 {
+            // slider sends 0-100; map to pot's 0-153 scale
+            let vol = (web_vol_raw as u32 * 153 / 100) as u8;
+            VOLUME_PCT.store(vol, Ordering::Relaxed);
+        }
+
         // ── Clock update every second (skip during chart) ─────────────────────
         if !chart_active && now - last_clock_ms >= 1000 {
             last_clock_ms = now;
             let mut st = ui_state.lock().unwrap();
             st.pot_enabled = POT_ENABLED.load(Ordering::Relaxed);
+            st.volume_pct  = VOLUME_PCT.load(Ordering::Relaxed);
             ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
         }
 
@@ -558,7 +577,7 @@ fn main() {
         if phys_screen || web_screen || web_select {
             last_debounce_screen_ms = now;
             last_auto_screen_ms     = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             chart_active = false;
             if web_select {
                 if let Some(s) = config::Screen::from_u8(web_select_raw as u8) {
@@ -587,7 +606,7 @@ fn main() {
         let phys_lamp = last_btn_light && !light && now - last_debounce_light_ms >= config::DEBOUNCE_MS;
         if phys_lamp {
             last_debounce_light_ms = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] lamp physical");
             let new_on = {
                 let st = ui_state.lock().unwrap();
@@ -611,13 +630,15 @@ fn main() {
         // ── Display power button (GPIO 32, active LOW, pull-up) ──────────────
         let disp_btn = btn_display.is_high();
         let phys_display = last_btn_display && !disp_btn && now - last_debounce_display_ms >= config::DEBOUNCE_MS;
-        let web_display  = config::WEB_SERVER_ENABLED && web_triggers.display.swap(false, Ordering::Relaxed);
+        let web_display_raw = if config::WEB_SERVER_ENABLED { web_triggers.display.swap(-1, Ordering::Relaxed) } else { -1i8 };
+        let web_display = web_display_raw >= 0;
         if phys_display || web_display {
             last_debounce_display_ms = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-            let sfo = !screen_forced_off.load(Ordering::Relaxed);
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
+            let sfo = if web_display { web_display_raw == 0 } else { !screen_forced_off.load(Ordering::Relaxed) };
             screen_forced_off.store(sfo, Ordering::Relaxed);
             persist.save_screen_forced(sfo);
+            if sfo { led_state.on_screen_off(); } else { led_state.on_screen_on(wifi_connected); }
             info!("[btn] display {} ({})", if sfo { "off" } else { "on" }, if web_display { "web" } else { "physical" });
         }
         last_btn_display = disp_btn;
@@ -627,7 +648,7 @@ fn main() {
         let phys_warm = last_btn_warm && !warm_btn && now - last_debounce_warm_ms >= config::DEBOUNCE_MS;
         if phys_warm {
             last_debounce_warm_ms = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] warm dim (physical)");
             lamp_handle.queue_warm_dim();
             if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
@@ -649,7 +670,7 @@ fn main() {
         let phys_bright = last_btn_bright && !bright_btn && now - last_debounce_bright_ms >= config::DEBOUNCE_MS;
         if phys_bright {
             last_debounce_bright_ms = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] bright white (physical)");
             lamp_handle.queue_bright_white();
             if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
@@ -669,11 +690,12 @@ fn main() {
         // ── Pot toggle button (GPIO 18, active LOW) — chart code preserved below ──
         let chart_btn = btn_chart.is_high();
         let phys_pot = last_btn_chart && !chart_btn && now - last_debounce_chart_ms >= config::DEBOUNCE_MS;
-        let web_pot  = config::WEB_SERVER_ENABLED && web_triggers.pot.swap(false, Ordering::Relaxed);
+        let web_pot_raw = if config::WEB_SERVER_ENABLED { web_triggers.pot.swap(-1, Ordering::Relaxed) } else { -1i8 };
+        let web_pot = web_pot_raw >= 0;
         if phys_pot || web_pot {
             last_debounce_chart_ms = now;
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
-            let enabled = !POT_ENABLED.load(Ordering::Relaxed);
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
+            let enabled = if web_pot { web_pot_raw == 1 } else { !POT_ENABLED.load(Ordering::Relaxed) };
             POT_ENABLED.store(enabled, Ordering::Relaxed);
             persist.save_pot_enabled(enabled);
             let mut st = ui_state.lock().unwrap();
@@ -690,7 +712,7 @@ fn main() {
         if phys_media || web_media {
             last_debounce_media_ms = now;
             info!("[btn] media play/pause ({})", if web_media { "web" } else { "physical" });
-            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low();
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             PLAY_PAUSE_READY.store(true, Ordering::Relaxed);
         }
         last_btn_media = media_btn;
@@ -764,14 +786,13 @@ fn main() {
         };
         let want_backlight = !screen_forced_off.load(Ordering::Relaxed) && (is_day || !lamp_known_off);
         if want_backlight != last_backlight { last_backlight = want_backlight; lcd.write_backlight(want_backlight); }
-        // LEDs always written directly — no dirty tracking to avoid init-state bugs.
-        // Coupled to want_backlight so LEDs and backlight are always in sync.
-        if want_backlight && wifi_connected { led_green.set_high().unwrap(); led_red.set_low().unwrap(); }
-        else if want_backlight             { led_green.set_low().unwrap();  led_red.set_high().unwrap(); }
-        else                               { led_green.set_low().unwrap();  led_red.set_low().unwrap(); }
-        // Blue LED: mic unmuted = on.
-        if MIC_UNMUTED.load(Ordering::Relaxed) { led_blue.set_high().unwrap(); }
-        else                                    { led_blue.set_low().unwrap(); }
+        // ── LEDs: apply LedState → hardware when changed ─────────────────────
+        let g = led_state.green.load(Ordering::Relaxed);
+        let r = led_state.red  .load(Ordering::Relaxed);
+        let b = led_state.blue .load(Ordering::Relaxed);
+        if g != last_hw_green { last_hw_green = g; if g { led_green.set_high().unwrap(); } else { led_green.set_low().unwrap(); } }
+        if r != last_hw_red   { last_hw_red   = r; if r { led_red  .set_high().unwrap(); } else { led_red  .set_low().unwrap(); } }
+        if b != last_hw_blue  { last_hw_blue  = b; if b { led_blue .set_high().unwrap(); } else { led_blue .set_low().unwrap(); } }
 
         // ── WiFi status + auto-reconnect every 15 s ──────────────────────────────
         if now - last_wifi_check_ms >= 15_000 {
@@ -795,6 +816,11 @@ fn main() {
                 let _ = unsafe { esp_idf_sys::esp_wifi_connect() };
             }
 
+            if connected != wifi_connected {
+                let screen_on = !screen_forced_off.load(Ordering::Relaxed);
+                if connected { led_state.on_wifi_connect(screen_on); }
+                else         { led_state.on_wifi_disconnect(screen_on); }
+            }
             if let Ok(mut st) = ui_state.lock() { st.wifi_connected = connected; }
         }
 
@@ -816,7 +842,6 @@ fn main() {
 
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
-static MIC_UNMUTED: AtomicBool = AtomicBool::new(false);
 static POT_ENABLED: AtomicBool = AtomicBool::new(true);
 
 
@@ -868,7 +893,7 @@ fn spawn_media_server() {
         .ok();
 }
 
-fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<screen::UiState>>) {
+fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<screen::UiState>>, led_state: Arc<led::LedState>) {
     std::thread::Builder::new()
         .name("mic-srv".into())
         .stack_size(6144)
@@ -887,8 +912,8 @@ fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<scre
                             let mut line = String::new();
                             if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
                                 match line.trim() {
-                                    "m:1" => { MIC_UNMUTED.store(true,  Ordering::Relaxed); info!("[mic] unmuted"); }
-                                    "m:0" => { MIC_UNMUTED.store(false, Ordering::Relaxed); info!("[mic] muted");   }
+                                    "m:1" => { led_state.set_blue(true);  info!("[mic] unmuted"); }
+                                    "m:0" => { led_state.set_blue(false); info!("[mic] muted");   }
                                     "l:t" => {
                                         let new_on = {
                                             let st = ui_state.lock().unwrap();

@@ -23,7 +23,7 @@ impl Default for LampState {
 
 /// Thread-safe lamp handle with a persistent Tuya LAN session.
 ///
-/// `target`: -1=OFF, 0=idle, 1=ON, 2=warm-dim, 3=bright-white.
+/// `target`: -1=OFF, 0=idle, 1=ON, 2=warm-dim, 3=bright-white, 4=custom white, 5=colour.
 pub struct LampHandle {
     ip:      [u8; 4],
     port:    u16,
@@ -35,16 +35,17 @@ pub struct LampHandle {
     suppress_until_ms: AtomicU32,
     retry_after_ms:    AtomicU32,
 
-    // Persistent TCP session — reused across polls and refreshes.
-    // Set to None on any I/O failure; reconnected lazily on next use.
     sess: Mutex<Option<session::Session>>,
 
-    // Custom brightness/temp for target==4 (web-set values, Tuya range).
+    // target==4: white mode with custom values (Tuya range).
     custom_brightness: AtomicU32, // 10–1000
     custom_temp:       AtomicU32, // 0–1000
 
-    // Last successfully applied values; reported via web /status.
-    // LAMP_UNKNOWN = never applied.
+    // target==5: colour mode (Tuya range).
+    custom_hue: AtomicU32, // 0–360
+    custom_sat: AtomicU32, // 0–1000
+    custom_val: AtomicU32, // 0–1000
+
     pub last_brightness: AtomicU32,
     pub last_temp:       AtomicU32,
 }
@@ -63,6 +64,9 @@ impl LampHandle {
             sess:              Mutex::new(None),
             custom_brightness: AtomicU32::new(500),
             custom_temp:       AtomicU32::new(500),
+            custom_hue:        AtomicU32::new(30),
+            custom_sat:        AtomicU32::new(1000),
+            custom_val:        AtomicU32::new(500),
             last_brightness:   AtomicU32::new(LAMP_UNKNOWN),
             last_temp:         AtomicU32::new(LAMP_UNKNOWN),
         }
@@ -173,6 +177,16 @@ impl LampHandle {
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
     }
 
+    /// Set colour mode with HSV in Tuya units (hue 0–360, sat 0–1000, val 0–1000).
+    pub fn queue_colour(&self, hue: u16, sat: u16, val: u16) {
+        self.custom_hue.store(hue.clamp(0, 360) as u32, Ordering::Relaxed);
+        self.custom_sat.store(sat.clamp(0, 1000) as u32, Ordering::Relaxed);
+        self.custom_val.store(val.clamp(0, 1000) as u32, Ordering::Relaxed);
+        *self.target.lock().unwrap() = 5;
+        self.retry_after_ms.store(0, Ordering::Relaxed);
+        self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+    }
+
     /// Last applied brightness as 0–100 percentage (LAMP_UNKNOWN if never set).
     pub fn brightness_pct(&self) -> u32 {
         let b = self.last_brightness.load(Ordering::Relaxed);
@@ -216,6 +230,22 @@ impl LampHandle {
                 self.do_send_dps(&dps).inspect(|_| {
                     self.last_brightness.store(b, Ordering::Relaxed);
                     self.last_temp.store(t, Ordering::Relaxed);
+                }).map(|_| true)
+             }
+             5 => {
+                let h  = self.custom_hue.load(Ordering::Relaxed).clamp(0, 360);
+                let sv = self.custom_sat.load(Ordering::Relaxed).clamp(0, 1000);
+                let v  = self.custom_val.load(Ordering::Relaxed).clamp(10, 1000);
+                // Power on first — bundling "20":true with colour DPS can reset the
+                // bulb to white mode before the colour DPS lands on some firmware.
+                self.do_send_dps(r#""20":true"#);
+                // DPS 24 format: HHHHSSSSVVVV (12 hex chars, Tuya colour mode).
+                let colour = std::format!("{:04x}{:04x}{:04x}", h, sv, v);
+                warn!("[tuya] colour cmd h={} s={} v={} hex={}", h, sv, v, colour);
+                let dps = std::format!(r#""21":"colour","24":"{}""#, colour);
+                self.do_send_dps(&dps).inspect(|_| {
+                    self.last_brightness.store(LAMP_UNKNOWN, Ordering::Relaxed);
+                    self.last_temp.store(LAMP_UNKNOWN, Ordering::Relaxed);
                 }).map(|_| true)
              }
              _ => return false,
