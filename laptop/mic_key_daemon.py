@@ -99,6 +99,24 @@ def _pa_subscriber():
                 _pa_proc = None
         time.sleep(2)
 
+# ── Poller — catches mic changes even when pactl subscribe misses them ─────────
+def _poller():
+    global _muted
+    while True:
+        time.sleep(1)
+        try:
+            actual = _actual_muted()
+            changed = False
+            with _state_mutex:
+                if actual != _muted:
+                    _muted = actual
+                    changed = True
+            if changed:
+                logging.info('mic state polled: %s', 'muted' if actual else 'unmuted')
+                _esp_event.set()
+        except Exception as e:
+            logging.warning('poll error: %s', e)
+
 # ── Watchdog — restarts pactl subscribe if it goes stale ──────────────────────
 def _watchdog():
     while True:
@@ -111,9 +129,10 @@ def _watchdog():
                 proc.kill()
 
 if __name__ == '__main__':
-    threading.Thread(target=_esp_sender,   daemon=True, name='esp-sender').start()
+    threading.Thread(target=_esp_sender,    daemon=True, name='esp-sender').start()
     threading.Thread(target=_pa_subscriber, daemon=True, name='pa-sub').start()
     threading.Thread(target=_watchdog,      daemon=True, name='watchdog').start()
+    threading.Thread(target=_poller,        daemon=True, name='poller').start()
     _esp_event.set()
     logging.info('startup: %s', 'muted' if _muted else 'unmuted')
     while True:

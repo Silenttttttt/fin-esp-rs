@@ -32,7 +32,7 @@ use log::{info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// LCD column where the 5-wide sand canvas starts (centered: (20-5)/2 = 7).
 const SAND_COL: u8 = 7;
@@ -480,11 +480,10 @@ fn main() {
         let now = millis();
 
         // ── Read state (brief lock) ───────────────────────────────────────────
-        let (lamp_anim_active, lamp_known_off, is_fetching, wifi_connected) = {
+        let (lamp_anim_active, is_fetching, wifi_connected) = {
             let st = ui_state.lock().unwrap();
-            let anim     = st.lamp_anim_until > 0 && now < st.lamp_anim_until;
-            let lamp_off = st.lamp.known && !st.lamp.on;
-            (anim, lamp_off, st.fetching, st.wifi_connected)
+            let anim = st.lamp_anim_until > 0 && now < st.lamp_anim_until;
+            (anim, st.fetching, st.wifi_connected)
         };
 
         // ── Record price history after each fetch ─────────────────────────────
@@ -619,7 +618,6 @@ fn main() {
                 st.lamp_loading_frame = 0;
             }
             last_lamp_loading_ms = now;
-            if new_on && screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
             last_loading_ms = now;
             row_cache.invalidate();
             let st = ui_state.lock().unwrap();
@@ -651,7 +649,6 @@ fn main() {
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] warm dim (physical)");
             lamp_handle.queue_warm_dim();
-            if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
             if let Ok(mut st) = ui_state.lock() {
                 st.lamp.on    = true;
                 st.lamp.known = true;
@@ -673,7 +670,6 @@ fn main() {
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] bright white (physical)");
             lamp_handle.queue_bright_white();
-            if screen_forced_off.load(Ordering::Relaxed) { screen_forced_off.store(false, Ordering::Relaxed); persist.save_screen_forced(false); }
             if let Ok(mut st) = ui_state.lock() {
                 st.lamp.on    = true;
                 st.lamp.known = true;
@@ -769,22 +765,8 @@ fn main() {
             }
         }
 
-        // ── Backlight + WiFi LEDs — single source of truth ───────────────────
-        // Both are driven here every loop iteration. Nothing else sets LEDs.
-        let is_day = {
-            let utc = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if utc > 1_600_000_000 {
-                let local = utc + config::GMT_OFFSET_SEC as i64;
-                let hour = (local.rem_euclid(86400) / 3600) as u8;
-                hour >= 6 && hour < 18
-            } else {
-                true
-            }
-        };
-        let want_backlight = !screen_forced_off.load(Ordering::Relaxed) && (is_day || !lamp_known_off);
+        // ── Backlight — driven by display toggle only ─────────────────────────
+        let want_backlight = !screen_forced_off.load(Ordering::Relaxed);
         if want_backlight != last_backlight { last_backlight = want_backlight; lcd.write_backlight(want_backlight); }
         // ── LEDs: apply LedState → hardware when changed ─────────────────────
         let g = led_state.green.load(Ordering::Relaxed);

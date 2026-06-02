@@ -242,6 +242,7 @@ button:active{opacity:.72;transform:scale(.96)}
     </div>
   </div>
   <button class="media-btn" onclick="act('/action/media')">&#9654;&#65039; Play / Pause</button>
+  <button class="media-btn" style="margin-top:.5rem;border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,#2a1010,#1a1010)" onclick="if(confirm('Reboot ESP32?'))act('/action/reboot')">&#x1F504; Reboot</button>
 </div>
 
 <script>
@@ -533,6 +534,11 @@ fn handle(
         ("POST", "/action/led/red/off")   => { leds.set_red(false);   ok(&mut s); }
         ("POST", "/action/led/blue/on")   => { leds.set_blue(true);   ok(&mut s); }
         ("POST", "/action/led/blue/off")  => { leds.set_blue(false);  ok(&mut s); }
+        ("POST", "/action/reboot") => {
+            ok(&mut s);
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { esp_idf_sys::esp_restart(); }
+        }
         _ => { write_response(&mut s, "404 Not Found", "text/plain", b"not found"); }
     }
 }
