@@ -35,9 +35,11 @@ _state_mutex = threading.Lock()
 
 def _actual_muted() -> bool:
     try:
+        src = subprocess.check_output(
+            ['pactl', 'get-default-source'], stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
         out = subprocess.check_output(
-            ['pactl', 'get-source-mute', _src],
-            stderr=subprocess.DEVNULL, timeout=2,
+            ['pactl', 'get-source-mute', src], stderr=subprocess.DEVNULL, timeout=2,
         ).decode()
         return out.split()[1] == 'yes'
     except Exception:
