@@ -833,7 +833,7 @@ static CURRENT_OWNER: Mutex<Option<String>> = Mutex::new(None);
 fn spawn_media_server() {
     std::thread::Builder::new()
         .name("media-srv".into())
-        .stack_size(4096)
+        .stack_size(8192)
         .spawn(|| {
             use std::net::TcpListener;
             loop {
@@ -852,7 +852,7 @@ fn spawn_media_server() {
                         Ok(s) => {
                             std::thread::Builder::new()
                                 .name("media-conn".into())
-                                .stack_size(6144)
+                                .stack_size(8192)
                                 .spawn(move || handle_media_connection(s))
                                 .ok();
                         }
@@ -875,24 +875,38 @@ fn spawn_media_server() {
 /// whichever happened to connect first. Volume and the keepalive stay
 /// broadcast to every connected machine, same as before - only play/pause
 /// routing is owner-gated.
-fn handle_media_connection(stream: std::net::TcpStream) {
-    use std::io::Write;
-    let mut reader = std::io::BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => { warn!("[media-srv] try_clone failed: {e}"); return; }
-    });
-    let mut id_line = String::new();
-    if reader.read_line(&mut id_line).is_err() || id_line.is_empty() {
-        warn!("[media-srv] connection closed before identifying");
-        return;
+fn handle_media_connection(mut s: std::net::TcpStream) {
+    use std::io::{Read, Write};
+    // Reads the "id:<machine>\n" handshake byte-by-byte directly off the one
+    // stream handle, deliberately NOT via try_clone()+BufReader - try_clone
+    // is a dup() under the hood, and esp-idf-svc's std::net support for it on
+    // this target turned out to be unreliable in practice (every connection
+    // was reset within milliseconds, right at this point, until switched to
+    // this single-handle read). A byte-at-a-time read is fine here: the
+    // handshake line is short (a hostname) and sent once, immediately, never
+    // a hot path.
+    let mut id_line = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        match s.read(&mut byte) {
+            Ok(0) => { warn!("[media-srv] connection closed before identifying"); return; }
+            Ok(_) => {
+                if byte[0] == b'\n' { break; }
+                id_line.push(byte[0]);
+                if id_line.len() > 128 {
+                    warn!("[media-srv] id: handshake too long, dropping connection");
+                    return;
+                }
+            }
+            Err(e) => { warn!("[media-srv] read err before identifying: {e}"); return; }
+        }
     }
-    let machine_id = match id_line.trim().strip_prefix("id:") {
+    let id_line = String::from_utf8_lossy(&id_line).trim().to_string();
+    let machine_id = match id_line.strip_prefix("id:") {
         Some(id) if !id.is_empty() => id.to_string(),
-        _ => { warn!("[media-srv] first line wasn't a valid id: handshake: {:?}", id_line.trim()); return; }
+        _ => { warn!("[media-srv] first line wasn't a valid id: handshake: {id_line:?}"); return; }
     };
     info!("[media-srv] {machine_id} connected");
-
-    let mut s = stream;
     let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
     let mut keepalive: u32 = 0;
     loop {
