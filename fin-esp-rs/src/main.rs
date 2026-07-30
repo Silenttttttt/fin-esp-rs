@@ -825,14 +825,16 @@ fn main() {
 static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
 static POT_ENABLED: AtomicBool = AtomicBool::new(true);
-
+// Which machine's mic last toggled - set by spawn_mic_server, read by every
+// media connection to decide whether IT is the one that should act on
+// PLAY_PAUSE_READY. None until the first mic message ever arrives.
+static CURRENT_OWNER: Mutex<Option<String>> = Mutex::new(None);
 
 fn spawn_media_server() {
     std::thread::Builder::new()
         .name("media-srv".into())
-        .stack_size(8192)
+        .stack_size(4096)
         .spawn(|| {
-            use std::io::Write;
             use std::net::TcpListener;
             loop {
                 let listener = match TcpListener::bind("0.0.0.0:9876") {
@@ -840,31 +842,19 @@ fn spawn_media_server() {
                     Err(e) => { warn!("[media-srv] bind err: {e}, retrying"); FreeRtos::delay_ms(2000); continue; }
                 };
                 info!("[media-srv] listening on :9876");
+                // One thread per accepted connection - up to one per real
+                // machine (desktop, laptop) can now stay connected at the
+                // same time, instead of the old design where a second
+                // machine's connection just sat unaccepted in the OS
+                // backlog until the first one dropped.
                 for stream in listener.incoming() {
                     match stream {
-                        Ok(mut s) => {
-                            info!("[media-srv] laptop connected");
-                            let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
-                            let mut keepalive: u32 = 0;
-                            loop {
-                                if PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
-                                    if s.write_all(b"p\n").is_err() { break; }
-                                    info!("[media-srv] play/pause sent");
-                                }
-                                let vol = VOLUME_PCT.load(Ordering::Relaxed);
-                                if vol != 255 && vol != last_vol {
-                                    let msg = std::format!("v:{}\n", vol);
-                                    if s.write_all(msg.as_bytes()).is_err() { break; }
-                                    last_vol = vol;
-                                }
-                                keepalive += 1;
-                                if keepalive >= 3000 {
-                                    if s.write_all(b"k\n").is_err() { break; }
-                                    keepalive = 0;
-                                }
-                                FreeRtos::delay_ms(10);
-                            }
-                            info!("[media-srv] laptop disconnected");
+                        Ok(s) => {
+                            std::thread::Builder::new()
+                                .name("media-conn".into())
+                                .stack_size(6144)
+                                .spawn(move || handle_media_connection(s))
+                                .ok();
                         }
                         Err(e) => { warn!("[media-srv] accept err: {e}"); break; }
                     }
@@ -873,6 +863,60 @@ fn spawn_media_server() {
             }
         })
         .ok();
+}
+
+/// One connected machine's send loop. The client's first line must be
+/// "id:<machine>\n" (mic_key_daemon.py/play_pause_server.py send this
+/// immediately on connect) - everything after that is unchanged from the
+/// old protocol. play/pause is only ever written to whichever connection's
+/// machine id currently matches CURRENT_OWNER (last machine to toggle its
+/// mic - see spawn_mic_server), so pressing the physical media button
+/// always goes to whichever computer you were just actively using, not
+/// whichever happened to connect first. Volume and the keepalive stay
+/// broadcast to every connected machine, same as before - only play/pause
+/// routing is owner-gated.
+fn handle_media_connection(stream: std::net::TcpStream) {
+    use std::io::Write;
+    let mut reader = std::io::BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => { warn!("[media-srv] try_clone failed: {e}"); return; }
+    });
+    let mut id_line = String::new();
+    if reader.read_line(&mut id_line).is_err() || id_line.is_empty() {
+        warn!("[media-srv] connection closed before identifying");
+        return;
+    }
+    let machine_id = match id_line.trim().strip_prefix("id:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => { warn!("[media-srv] first line wasn't a valid id: handshake: {:?}", id_line.trim()); return; }
+    };
+    info!("[media-srv] {machine_id} connected");
+
+    let mut s = stream;
+    let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
+    let mut keepalive: u32 = 0;
+    loop {
+        let is_owner = CURRENT_OWNER.lock()
+            .map(|o| o.as_deref() == Some(machine_id.as_str()))
+            .unwrap_or(false);
+        if is_owner && PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
+            if s.write_all(b"p\n").is_err() { break; }
+            info!("[media-srv] play/pause sent -> {machine_id}");
+        }
+        let vol = VOLUME_PCT.load(Ordering::Relaxed);
+        if vol != 255 && vol != last_vol {
+            let msg = std::format!("v:{}\n", vol);
+            if s.write_all(msg.as_bytes()).is_err() { break; }
+            last_vol = vol;
+        }
+        keepalive += 1;
+        if keepalive >= 3000 {
+            if s.write_all(b"k\n").is_err() { break; }
+            keepalive = 0;
+        }
+        FreeRtos::delay_ms(10);
+    }
+    info!("[media-srv] {machine_id} disconnected");
 }
 
 fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<screen::UiState>>, led_state: Arc<led::LedState>) {
@@ -893,10 +937,27 @@ fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<scre
                         Ok(s) => {
                             let mut line = String::new();
                             if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
-                                match line.trim() {
-                                    "m:1" => { led_state.set_blue(true);  info!("[mic] unmuted"); }
-                                    "m:0" => { led_state.set_blue(false); info!("[mic] muted");   }
-                                    "l:t" => {
+                                let parts: Vec<&str> = line.trim().splitn(3, ':').collect();
+                                match parts.as_slice() {
+                                    // Tagged: "m:<0|1>:<machine>" - mic_key_daemon.py always
+                                    // sends this shape now, tagging which machine toggled so
+                                    // the media server knows who to route play/pause to.
+                                    ["m", state, machine] => {
+                                        let unmuted = *state == "1";
+                                        led_state.set_blue(unmuted);
+                                        info!("[mic] {} ({machine})", if unmuted { "unmuted" } else { "muted" });
+                                        if let Ok(mut owner) = CURRENT_OWNER.lock() {
+                                            *owner = Some(machine.to_string());
+                                        }
+                                    }
+                                    // Defensive fallback for an untagged/old-format sender -
+                                    // still reflects mic state, just can't claim ownership.
+                                    ["m", state] => {
+                                        let unmuted = *state == "1";
+                                        led_state.set_blue(unmuted);
+                                        info!("[mic] {} (no machine id)", if unmuted { "unmuted" } else { "muted" });
+                                    }
+                                    ["l", "t"] => {
                                         let new_on = {
                                             let st = ui_state.lock().unwrap();
                                             lamp_handle.flip_target(st.lamp.on)
