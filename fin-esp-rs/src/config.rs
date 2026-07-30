@@ -119,6 +119,19 @@ pub const TUYA_PROTOCOL_VERSION: u8 = 5; // 3.5
 // Set WEB_SERVER=1 in .env to enable; omit or set to empty to disable.
 pub const WEB_SERVER_ENABLED: bool = option_env!("WEB_SERVER").is_some();
 
+// Hardware that's been physically removed/replaced - feature-flagged off
+// rather than deleted, in case any of it is ever reconnected. The button
+// (and its web toggle) still runs, it just no longer does anything beyond
+// the shared red-flash/clear every button already does.
+//
+// Screen (LCD) unplugged - wasn't being used. Display-power button's
+// "force screen off" toggle has nothing left to affect.
+pub const DISPLAY_TOGGLE_ENABLED: bool = false;
+// Volume potentiometer unplugged (too noisy) - replaced by the new
+// keyboard's own volume scroll wheel. Nothing left for this on/off toggle
+// to enable.
+pub const POT_TOGGLE_ENABLED: bool = false;
+
 // Screen identifiers
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {

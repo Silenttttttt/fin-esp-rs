@@ -633,11 +633,18 @@ fn main() {
         if phys_display || web_display {
             last_debounce_display_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
-            let sfo = if web_display { web_display_raw == 0 } else { !screen_forced_off.load(Ordering::Relaxed) };
-            screen_forced_off.store(sfo, Ordering::Relaxed);
-            persist.save_screen_forced(sfo);
-            if sfo { led_state.on_screen_off(); } else { led_state.on_screen_on(wifi_connected); }
-            info!("[btn] display {} ({})", if sfo { "off" } else { "on" }, if web_display { "web" } else { "physical" });
+            // DISABLED (config::DISPLAY_TOGGLE_ENABLED) - screen (LCD) is
+            // physically disconnected, so toggling "is the screen forced
+            // off" has no real effect. Left in place, not deleted, in case
+            // the screen is ever reconnected - the button (and the web
+            // toggle) still runs the red-flash/clear above either way.
+            if config::DISPLAY_TOGGLE_ENABLED {
+                let sfo = if web_display { web_display_raw == 0 } else { !screen_forced_off.load(Ordering::Relaxed) };
+                screen_forced_off.store(sfo, Ordering::Relaxed);
+                persist.save_screen_forced(sfo);
+                if sfo { led_state.on_screen_off(); } else { led_state.on_screen_on(wifi_connected); }
+                info!("[btn] display {} ({})", if sfo { "off" } else { "on" }, if web_display { "web" } else { "physical" });
+            }
         }
         last_btn_display = disp_btn;
 
@@ -691,13 +698,21 @@ fn main() {
         if phys_pot || web_pot {
             last_debounce_chart_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
-            let enabled = if web_pot { web_pot_raw == 1 } else { !POT_ENABLED.load(Ordering::Relaxed) };
-            POT_ENABLED.store(enabled, Ordering::Relaxed);
-            persist.save_pot_enabled(enabled);
-            let mut st = ui_state.lock().unwrap();
-            st.pot_enabled = enabled;
-            info!("[btn] pot {} ({})", if enabled { "on" } else { "off" }, if web_pot { "web" } else { "physical" });
-            ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
+            // DISABLED (config::POT_TOGGLE_ENABLED) - the potentiometer
+            // itself is unplugged (too noisy, replaced by the new
+            // keyboard's volume scroll wheel), so there's nothing left to
+            // enable/disable here. Left in place, not deleted, in case the
+            // pot is ever reconnected - the button (and the web toggle)
+            // still runs the red-flash/clear above either way.
+            if config::POT_TOGGLE_ENABLED {
+                let enabled = if web_pot { web_pot_raw == 1 } else { !POT_ENABLED.load(Ordering::Relaxed) };
+                POT_ENABLED.store(enabled, Ordering::Relaxed);
+                persist.save_pot_enabled(enabled);
+                let mut st = ui_state.lock().unwrap();
+                st.pot_enabled = enabled;
+                info!("[btn] pot {} ({})", if enabled { "on" } else { "off" }, if web_pot { "web" } else { "physical" });
+                ticker::paint_header(&mut lcd, &mut row_cache, &st, now);
+            }
         }
         last_btn_chart = chart_btn;
 

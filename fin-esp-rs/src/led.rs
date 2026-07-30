@@ -13,34 +13,39 @@ impl LedState {
     pub fn new() -> Self {
         Self {
             green: AtomicBool::new(false),
-            red:   AtomicBool::new(true), // red on at boot until wifi connects
+            // Used to default to true ("red on until wifi connects"), back
+            // when red was a pure wifi-status indicator. Red is now
+            // repurposed as the "cloud message pending" signal (cleared by
+            // pressing any button, set on by the web API) - defaulting it
+            // on at every boot would misreport a pending message that
+            // isn't there, so this now starts false like the others.
+            red:   AtomicBool::new(false),
             blue:  AtomicBool::new(false),
         }
     }
 
-    /// Screen turned on: green reflects wifi, red reflects no-wifi.
-    pub fn on_screen_on(&self, wifi: bool) {
-        self.green.store(wifi,  Ordering::Relaxed);
-        self.red  .store(!wifi, Ordering::Relaxed);
-    }
+    /// DISABLED - screen (LCD) is physically disconnected, and red is now
+    /// the "cloud message pending" indicator (see WRITE_PROTECTION/red LED
+    /// usage in main.rs's button handlers and the web API). This used to
+    /// tie green/red to wifi status whenever the screen toggled on/off;
+    /// left as a real no-op (not deleted) in case the screen and its
+    /// original wifi-status-LED behavior are ever wanted back - every
+    /// call site in main.rs is unchanged and still calls this.
+    pub fn on_screen_on(&self, _wifi: bool) {}
 
-    /// Screen turned off: both indicator LEDs off.
-    pub fn on_screen_off(&self) {
-        self.green.store(false, Ordering::Relaxed);
-        self.red  .store(false, Ordering::Relaxed);
-    }
+    /// DISABLED - see on_screen_on.
+    pub fn on_screen_off(&self) {}
 
-    /// Wifi connected: green on (if screen is on), red off.
-    pub fn on_wifi_connect(&self, screen_on: bool) {
-        if screen_on { self.green.store(true, Ordering::Relaxed); }
-        self.red.store(false, Ordering::Relaxed);
-    }
+    /// DISABLED - wifi connect/disconnect used to auto-drive green/red as
+    /// a connectivity indicator; that conflicts with red's new "cloud
+    /// message pending" meaning (a wifi blip would silently clear or set
+    /// it regardless of any real pending message). Kept as a real no-op,
+    /// not deleted, in case the original wifi-status-LED behavior is ever
+    /// wanted back on a LED that isn't doing double duty anymore.
+    pub fn on_wifi_connect(&self, _screen_on: bool) {}
 
-    /// Wifi disconnected: green off, red on (if screen is on).
-    pub fn on_wifi_disconnect(&self, screen_on: bool) {
-        self.green.store(false, Ordering::Relaxed);
-        if screen_on { self.red.store(true, Ordering::Relaxed); }
-    }
+    /// DISABLED - see on_wifi_connect.
+    pub fn on_wifi_disconnect(&self, _screen_on: bool) {}
 
     pub fn set_green(&self, on: bool) { self.green.store(on, Ordering::Relaxed); }
     pub fn set_red  (&self, on: bool) { self.red  .store(on, Ordering::Relaxed); }
