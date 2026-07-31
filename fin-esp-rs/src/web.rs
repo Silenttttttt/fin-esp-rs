@@ -219,30 +219,16 @@ button:active{opacity:.72;transform:scale(.96)}
 
 <div class="card">
   <div class="ch"><h2>System</h2></div>
-  <div class="sys">
-    <div class="si">Display
-      <label class="sw" style="margin-left:0">
-        <input type="checkbox" id="disp" onchange="if(!_upd)act('/action/display/'+(this.checked?'on':'off'))">
-        <span class="sw-t"></span><span class="sw-k"></span>
-      </label>
-    </div>
-    <div class="si">Pot
-      <label class="sw" style="margin-left:0">
-        <input type="checkbox" id="pot" onchange="if(!_upd)act('/action/pot/'+(this.checked?'on':'off'))">
-        <span class="sw-t"></span><span class="sw-k"></span>
-      </label>
-    </div>
-  </div>
-  <div class="sliders" style="margin-top:0;margin-bottom:.75rem">
-    <div class="sl-row">
-      <span class="sl-l">Volume</span>
-      <input type="range" id="vsl" min="0" max="100" value="50"
-        oninput="volUpd()" onmouseup="sendVol()" ontouchend="sendVol()">
-      <span class="sl-v" id="vv">--</span>
-    </div>
-  </div>
-  <button class="media-btn" onclick="act('/action/media')">&#9654;&#65039; Play / Pause</button>
-  <button class="media-btn" style="margin-top:.5rem;border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,#2a1010,#1a1010)" onclick="if(confirm('Reboot ESP32?'))act('/action/reboot')">&#x1F504; Reboot</button>
+  <!-- Display/Pot toggles and the untargeted Play/Pause+Volume controls were
+       removed from this card on purpose: the screen and potentiometer are
+       physically disconnected (dead hardware - see config::DISPLAY_TOGGLE_ENABLED
+       / config::POT_TOGGLE_ENABLED, both false, firmware support kept intact,
+       just gated off), and untargeted media control is now fully superseded
+       by the "Per-Machine Media" card below (explicit Desktop/Laptop control
+       instead of ambiguous "whichever machine last toggled its mic"). The
+       underlying /action/display, /action/pot, /action/media, /action/volume
+       routes still exist server-side - only this UI's use of them was removed. -->
+  <button class="media-btn" style="border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,#2a1010,#1a1010)" onclick="if(confirm('Reboot ESP32?'))act('/action/reboot')">&#x1F504; Reboot</button>
 </div>
 
 <div class="card">
@@ -313,15 +299,6 @@ function slUpd(){
   document.getElementById('tv').textContent=
     t<15?'warm':t<40?'warm-ish':t<60?'neutral':t<85?'cool-ish':'cool';
 }
-var _serverVol=-1;
-function volUpd(){
-  document.getElementById('vv').textContent=document.getElementById('vsl').value+'%';
-}
-function sendVol(){
-  var v=+document.getElementById('vsl').value;
-  if(v===_serverVol)return;
-  post('/action/volume?v='+v);
-}
 function hueUpd(){
   var h=+document.getElementById('hsl').value;
   document.getElementById('hdot').style.background='hsl('+h+',100%,50%)';
@@ -389,13 +366,6 @@ function refresh(){
     ledUpd('green',d.led_green);
     ledUpd('red',d.led_red);
     ledUpd('blue',d.led_blue);
-    setChk('disp',d.display_on);
-    setChk('pot',d.pot_on);
-    if(d.volume!==null&&document.activeElement!==document.getElementById('vsl')){
-      _serverVol=d.volume;
-      document.getElementById('vsl').value=d.volume;
-      document.getElementById('vv').textContent=d.volume+'%';
-    }
     var p=d.prices;
     document.getElementById('pv0').textContent='$'+fmtP(p.btc,0);
     document.getElementById('pc0').innerHTML=fmtC(p.btc_chg);

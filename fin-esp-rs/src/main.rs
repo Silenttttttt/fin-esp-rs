@@ -982,13 +982,20 @@ fn handle_media_connection(mut s: std::net::TcpStream) {
         }
         let vol = VOLUME_PCT.load(Ordering::Relaxed);
         if vol != 255 && vol != last_vol {
-            let msg = std::format!("v:{}\n", vol);
+            // VOLUME_PCT is internal 0-153 (pot's sqrt-curve range) - the wire
+            // protocol and play_pause_server.py's `pactl set-sink-volume {v}%`
+            // both expect a plain 0-100 percentage, so rescale before sending.
+            // Sending the raw 0-153 value here was a real bug (e.g. a 100%
+            // slider became "v:153" -> 153% volume client-side).
+            let pct = (vol as u32 * 100 / 153).min(100) as u8;
+            let msg = std::format!("v:{}\n", pct);
             if s.write_all(msg.as_bytes()).is_err() { break; }
             last_vol = vol;
         }
         if let Some(targeted_vol) = peek_volume_target(&machine_id) {
             if last_targeted_vol != Some(targeted_vol) {
-                let msg = std::format!("v:{}\n", targeted_vol);
+                let pct = (targeted_vol as u32 * 100 / 153).min(100) as u8;
+                let msg = std::format!("v:{}\n", pct);
                 if s.write_all(msg.as_bytes()).is_err() { break; }
                 last_targeted_vol = Some(targeted_vol);
             }
