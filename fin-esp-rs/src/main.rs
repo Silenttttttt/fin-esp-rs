@@ -1006,7 +1006,7 @@ fn handle_media_connection(mut s: std::net::TcpStream) {
 fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<screen::UiState>>, led_state: Arc<led::LedState>) {
     std::thread::Builder::new()
         .name("mic-srv".into())
-        .stack_size(6144)
+        .stack_size(4096)
         .spawn(move || {
             use std::net::TcpListener;
             loop {
@@ -1015,54 +1015,84 @@ fn spawn_mic_server(lamp_handle: Arc<tuya::LampHandle>, ui_state: Arc<Mutex<scre
                     Err(e) => { warn!("[mic-srv] bind err: {e}, retrying"); FreeRtos::delay_ms(2000); continue; }
                 };
                 info!("[mic-srv] listening on :9877");
-                let mut err = false;
+                // One thread per accepted connection, each looping over
+                // multiple lines - was previously one-shot (mic_key_daemon.py
+                // dialed a brand new TCP connection for every single mic
+                // toggle). That meant paying a full TCP handshake round-trip
+                // on real wifi for every press (measured ~120ms end-to-end)
+                // for what should feel instant. Now the client keeps one
+                // connection open and this thread just keeps reading lines
+                // off it. Receive-only (no reply ever written back), so no
+                // try_clone() needed here unlike the media server.
                 for stream in listener.incoming() {
                     match stream {
                         Ok(s) => {
-                            let mut line = String::new();
-                            if std::io::BufReader::new(s).read_line(&mut line).is_ok() {
-                                let parts: Vec<&str> = line.trim().splitn(3, ':').collect();
-                                match parts.as_slice() {
-                                    // Tagged: "m:<0|1>:<machine>" - mic_key_daemon.py always
-                                    // sends this shape now, tagging which machine toggled so
-                                    // the media server knows who to route play/pause to.
-                                    ["m", state, machine] => {
-                                        let unmuted = *state == "1";
-                                        led_state.set_blue(unmuted);
-                                        info!("[mic] {} ({machine})", if unmuted { "unmuted" } else { "muted" });
-                                        if let Ok(mut owner) = CURRENT_OWNER.lock() {
-                                            *owner = Some(machine.to_string());
-                                        }
-                                    }
-                                    // Defensive fallback for an untagged/old-format sender -
-                                    // still reflects mic state, just can't claim ownership.
-                                    ["m", state] => {
-                                        let unmuted = *state == "1";
-                                        led_state.set_blue(unmuted);
-                                        info!("[mic] {} (no machine id)", if unmuted { "unmuted" } else { "muted" });
-                                    }
-                                    ["l", "t"] => {
-                                        let new_on = {
-                                            let st = ui_state.lock().unwrap();
-                                            lamp_handle.flip_target(st.lamp.on)
-                                        };
-                                        if let Ok(mut st) = ui_state.lock() {
-                                            st.lamp.on    = new_on;
-                                            st.lamp.known = true;
-                                        }
-                                        info!("[lamp] toggled via laptop -> {}", if new_on { "on" } else { "off" });
-                                    }
-                                    _ => {}
-                                }
-                            }
+                            let lamp_handle = Arc::clone(&lamp_handle);
+                            let ui_state = Arc::clone(&ui_state);
+                            let led_state = Arc::clone(&led_state);
+                            std::thread::Builder::new()
+                                .name("mic-conn".into())
+                                .stack_size(6144)
+                                .spawn(move || handle_mic_connection(s, lamp_handle, ui_state, led_state))
+                                .ok();
                         }
-                        Err(e) => { warn!("[mic-srv] accept err: {e}"); err = true; break; }
+                        Err(e) => { warn!("[mic-srv] accept err: {e}"); FreeRtos::delay_ms(1000); }
                     }
                 }
-                if err { FreeRtos::delay_ms(1000); }
             }
         })
         .ok();
+}
+
+fn handle_mic_connection(
+    stream: std::net::TcpStream,
+    lamp_handle: Arc<tuya::LampHandle>,
+    ui_state: Arc<Mutex<screen::UiState>>,
+    led_state: Arc<led::LedState>,
+) {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+    info!("[mic-srv] {peer} connected");
+    let reader = std::io::BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => { warn!("[mic-srv] {peer} read err: {e}"); break; }
+        };
+        let parts: Vec<&str> = line.trim().splitn(3, ':').collect();
+        match parts.as_slice() {
+            // Tagged: "m:<0|1>:<machine>" - mic_key_daemon.py always
+            // sends this shape now, tagging which machine toggled so
+            // the media server knows who to route play/pause to.
+            ["m", state, machine] => {
+                let unmuted = *state == "1";
+                led_state.set_blue(unmuted);
+                info!("[mic] {} ({machine})", if unmuted { "unmuted" } else { "muted" });
+                if let Ok(mut owner) = CURRENT_OWNER.lock() {
+                    *owner = Some(machine.to_string());
+                }
+            }
+            // Defensive fallback for an untagged/old-format sender -
+            // still reflects mic state, just can't claim ownership.
+            ["m", state] => {
+                let unmuted = *state == "1";
+                led_state.set_blue(unmuted);
+                info!("[mic] {} (no machine id)", if unmuted { "unmuted" } else { "muted" });
+            }
+            ["l", "t"] => {
+                let new_on = {
+                    let st = ui_state.lock().unwrap();
+                    lamp_handle.flip_target(st.lamp.on)
+                };
+                if let Ok(mut st) = ui_state.lock() {
+                    st.lamp.on    = new_on;
+                    st.lamp.known = true;
+                }
+                info!("[lamp] toggled via laptop -> {}", if new_on { "on" } else { "off" });
+            }
+            _ => {}
+        }
+    }
+    info!("[mic-srv] {peer} disconnected");
 }
 
 /// Milliseconds since boot via esp_timer (same source the clock uses).
