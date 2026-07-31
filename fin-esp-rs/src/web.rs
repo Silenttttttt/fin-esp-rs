@@ -245,7 +245,50 @@ button:active{opacity:.72;transform:scale(.96)}
   <button class="media-btn" style="margin-top:.5rem;border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,#2a1010,#1a1010)" onclick="if(confirm('Reboot ESP32?'))act('/action/reboot')">&#x1F504; Reboot</button>
 </div>
 
+<div class="card">
+  <div class="ch"><h2>Per-Machine Media</h2></div>
+  <div style="display:flex;flex-direction:column;gap:.9rem">
+    <div>
+      <div class="sl-l" style="margin-bottom:.4rem">Desktop</div>
+      <div class="sliders" style="margin-bottom:.5rem">
+        <div class="sl-row">
+          <span class="sl-l">Volume</span>
+          <input type="range" id="vsl-desktop" min="0" max="100" value="50"
+            oninput="volUpdM('desktop')" onmouseup="sendVolM('desktop')" ontouchend="sendVolM('desktop')">
+          <span class="sl-v" id="vv-desktop">--</span>
+        </div>
+      </div>
+      <button class="media-btn" onclick="actTarget('desktop')">&#9654;&#65039; Play / Pause (Desktop)</button>
+    </div>
+    <div>
+      <div class="sl-l" style="margin-bottom:.4rem">Laptop</div>
+      <div class="sliders" style="margin-bottom:.5rem">
+        <div class="sl-row">
+          <span class="sl-l">Volume</span>
+          <input type="range" id="vsl-laptop" min="0" max="100" value="50"
+            oninput="volUpdM('laptop')" onmouseup="sendVolM('laptop')" ontouchend="sendVolM('laptop')">
+          <span class="sl-v" id="vv-laptop">--</span>
+        </div>
+      </div>
+      <button class="media-btn" onclick="actTarget('laptop')">&#9654;&#65039; Play / Pause (Laptop)</button>
+    </div>
+  </div>
+</div>
+
 <script>
+// Real hostnames the two machines identify themselves with (see
+// mic_key_daemon.py/play_pause_server.py's MACHINE_ID = socket.gethostname()).
+var MACHINE_IDS={desktop:'silent-ms7e56',laptop:'silent'};
+function actTarget(who){
+  post('/action/media/target?machine='+encodeURIComponent(MACHINE_IDS[who]));
+}
+function volUpdM(who){
+  document.getElementById('vv-'+who).textContent=document.getElementById('vsl-'+who).value+'%';
+}
+function sendVolM(who){
+  var v=+document.getElementById('vsl-'+who).value;
+  post('/action/volume/target?machine='+encodeURIComponent(MACHINE_IDS[who])+'&v='+v);
+}
 var _upd=false;
 function post(u){return fetch(u,{method:'POST',headers:{'X-FinESP':'1'}});}
 function setChk(id,v){_upd=true;document.getElementById(id).checked=v;_upd=false;}
@@ -411,6 +454,15 @@ fn get_param(query: &str, key: &str) -> Option<i32> {
     None
 }
 
+fn get_param_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for part in query.split('&') {
+        if let Some((k, v)) = part.split_once('=') {
+            if k == key && !v.is_empty() { return Some(v); }
+        }
+    }
+    None
+}
+
 // ── Request handler ───────────────────────────────────────────────────────────
 
 fn handle(
@@ -516,6 +568,25 @@ fn handle(
                 let vol_raw = (v as u32 * 153 / 100) as u8;
                 if let Ok(mut st) = ui_state.lock() { st.volume_pct = vol_raw; }
                 triggers.volume.store(v as i8, Ordering::Relaxed);
+            }
+            ok(&mut s);
+        }
+        // ── Per-machine explicit control ───────────────────────────────────
+        // Targets one named machine directly (see main.rs's MEDIA_TARGETS /
+        // VOLUME_TARGETS + handle_media_connection) - independent of
+        // CURRENT_OWNER, so either machine is controllable from the web
+        // regardless of which one last toggled its mic.
+        ("POST", "/action/media/target") => {
+            if let Some(machine) = get_param_str(query, "machine") {
+                crate::queue_media_for_machine(machine);
+            }
+            ok(&mut s);
+        }
+        ("POST", "/action/volume/target") => {
+            let v = get_param(query, "v").unwrap_or(-1).clamp(0, 100);
+            if let (Some(machine), true) = (get_param_str(query, "machine"), v >= 0) {
+                let vol_raw = (v as u32 * 153 / 100) as u8;
+                crate::queue_volume_for_machine(machine, vol_raw);
             }
             ok(&mut s);
         }

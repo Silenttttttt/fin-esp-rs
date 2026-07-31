@@ -845,6 +845,46 @@ static POT_ENABLED: AtomicBool = AtomicBool::new(true);
 // PLAY_PAUSE_READY. None until the first mic message ever arrives.
 static CURRENT_OWNER: Mutex<Option<String>> = Mutex::new(None);
 
+// Explicit per-machine targets, set from the web UI's per-machine controls
+// (see web.rs's /action/media/target and /action/volume/target) - these
+// bypass CURRENT_OWNER entirely, the whole point being to control either
+// machine from the web regardless of which one last toggled its mic. Plain
+// Vec<(String, _)> rather than a HashMap: only ever 2-3 real entries, and
+// this avoids pulling in a hasher/extra crate for something this small.
+static MEDIA_TARGETS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+static VOLUME_TARGETS: Mutex<Vec<(String, u8)>> = Mutex::new(Vec::new());
+
+/// Called from web.rs's POST /action/media/target?machine=<id> handler.
+pub fn queue_media_for_machine(machine: &str) {
+    let mut targets = MEDIA_TARGETS.lock().unwrap();
+    match targets.iter_mut().find(|(m, _)| m == machine) {
+        Some(entry) => entry.1 = true,
+        None => targets.push((machine.to_string(), true)),
+    }
+}
+
+fn take_media_target(machine: &str) -> bool {
+    let mut targets = MEDIA_TARGETS.lock().unwrap();
+    match targets.iter_mut().find(|(m, _)| m == machine) {
+        Some(entry) => std::mem::replace(&mut entry.1, false),
+        None => false,
+    }
+}
+
+/// Called from web.rs's POST /action/volume/target?machine=<id>&v=<N> handler.
+/// `vol` is already in the same 0-153 internal range VOLUME_PCT uses.
+pub fn queue_volume_for_machine(machine: &str, vol: u8) {
+    let mut targets = VOLUME_TARGETS.lock().unwrap();
+    match targets.iter_mut().find(|(m, _)| m == machine) {
+        Some(entry) => entry.1 = vol,
+        None => targets.push((machine.to_string(), vol)),
+    }
+}
+
+fn peek_volume_target(machine: &str) -> Option<u8> {
+    VOLUME_TARGETS.lock().unwrap().iter().find(|(m, _)| m == machine).map(|(_, v)| *v)
+}
+
 fn spawn_media_server() {
     std::thread::Builder::new()
         .name("media-srv".into())
@@ -923,6 +963,7 @@ fn handle_media_connection(mut s: std::net::TcpStream) {
     };
     info!("[media-srv] {machine_id} connected");
     let mut last_vol: u8 = VOLUME_PCT.load(Ordering::Relaxed);
+    let mut last_targeted_vol: Option<u8> = None;
     let mut keepalive: u32 = 0;
     loop {
         let is_owner = CURRENT_OWNER.lock()
@@ -930,13 +971,27 @@ fn handle_media_connection(mut s: std::net::TcpStream) {
             .unwrap_or(false);
         if is_owner && PLAY_PAUSE_READY.swap(false, Ordering::Relaxed) {
             if s.write_all(b"p\n").is_err() { break; }
-            info!("[media-srv] play/pause sent -> {machine_id}");
+            info!("[media-srv] play/pause sent -> {machine_id} (mic-owner)");
+        }
+        // Explicit per-machine web target - independent of ownership, so
+        // either machine can be controlled directly regardless of which
+        // one last toggled its mic.
+        if take_media_target(&machine_id) {
+            if s.write_all(b"p\n").is_err() { break; }
+            info!("[media-srv] play/pause sent -> {machine_id} (web target)");
         }
         let vol = VOLUME_PCT.load(Ordering::Relaxed);
         if vol != 255 && vol != last_vol {
             let msg = std::format!("v:{}\n", vol);
             if s.write_all(msg.as_bytes()).is_err() { break; }
             last_vol = vol;
+        }
+        if let Some(targeted_vol) = peek_volume_target(&machine_id) {
+            if last_targeted_vol != Some(targeted_vol) {
+                let msg = std::format!("v:{}\n", targeted_vol);
+                if s.write_all(msg.as_bytes()).is_err() { break; }
+                last_targeted_vol = Some(targeted_vol);
+            }
         }
         keepalive += 1;
         if keepalive >= 3000 {
