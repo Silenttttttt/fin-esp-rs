@@ -38,6 +38,7 @@ const HTML: &[u8] = br##"<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fin-ESP</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%238b5cf6'/%3E%3Ctext x='50' y='71' font-size='58' text-anchor='middle'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E">
 <style>
 :root{--bg:#07070f;--s1:#0e0e1b;--s2:#131326;--bd:rgba(255,255,255,.07);
   --acc:#8b5cf6;--acc2:#6d28d9;--up:#22c55e;--dn:#ef4444;
