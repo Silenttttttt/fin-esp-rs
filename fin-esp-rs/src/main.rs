@@ -772,7 +772,18 @@ fn main() {
                 vol_smoothed = (vol_smoothed * (256 - alpha) + raw_fp * alpha) / 256;
             }
             let vol = (vol_smoothed / 256) as u8;
-            if POT_ENABLED.load(Ordering::Relaxed) {
+            // config::POT_TOGGLE_ENABLED is the real, permanent gate now -
+            // the pot is physically disconnected, so this block still reads
+            // the (floating) ADC pin above for diagnostics, but must never
+            // let that reading reach VOLUME_PCT. POT_ENABLED alone was NOT
+            // sufficient: it defaults to `true` and, worse, gets restored
+            // from NVS-persisted state at boot (whatever was saved back
+            // when the pot was still connected) - with the toggle button
+            // itself disabled, nothing could ever set it back to `false`
+            // again. Confirmed live: this let real ADC noise off a
+            // disconnected pin silently overwrite the real volume,
+            // surfacing as "the volume randomly drops" with no user action.
+            if config::POT_TOGGLE_ENABLED && POT_ENABLED.load(Ordering::Relaxed) {
                 let prev = VOLUME_PCT.load(Ordering::Relaxed);
                 if prev == 255 || (vol as i16 - prev as i16).abs() >= 5 {
                     VOLUME_PCT.store(vol, Ordering::Relaxed);
