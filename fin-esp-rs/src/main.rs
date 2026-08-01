@@ -85,34 +85,49 @@ fn main() {
     // Cold power-on (POWERON): capacitors are charging, supply is soft → 1 s.
     // Brownout reset: supply couldn't handle the radio spike last time → 3 s.
     // Software resets (OTA, watchdog, panic) need no delay — supply is stable.
-    match unsafe { esp_idf_sys::esp_reset_reason() } {
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_POWERON => {
-            info!("[boot] cold start — settling 1 s");
-            FreeRtos::delay_ms(1000);
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_BROWNOUT => {
-            info!("[boot] brownout reset — settling 3 s");
-            FreeRtos::delay_ms(3000);
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_PANIC => {
-            info!("[boot] reset reason: PANIC (stack overflow or abort)");
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_INT_WDT => {
-            info!("[boot] reset reason: INT WATCHDOG");
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_TASK_WDT => {
-            info!("[boot] reset reason: TASK WATCHDOG");
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_WDT => {
-            info!("[boot] reset reason: OTHER WATCHDOG");
-        }
-        r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_SW => {
-            info!("[boot] reset reason: software reset (OTA or esp_restart)");
-        }
-        r => {
-            info!("[boot] reset reason: unknown ({})", r);
-        }
-    }
+    // Captured here (reset reason is only valid to read once, right at boot)
+    // and reported to device-events once wifi is up further down - this is
+    // the exact diagnostic signal the ESP32 crash/flap investigation was
+    // missing (no way to tell "WiFi blip" from "firmware panicked and
+    // rebooted" over HTTP). See where `boot_reason`/`boot_severity` are used
+    // near `st.wifi_connected = true`.
+    let (boot_reason, boot_severity): (&'static str, &'static str) =
+        match unsafe { esp_idf_sys::esp_reset_reason() } {
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_POWERON => {
+                info!("[boot] cold start — settling 1 s");
+                FreeRtos::delay_ms(1000);
+                ("cold_start", "info")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_BROWNOUT => {
+                info!("[boot] brownout reset — settling 3 s");
+                FreeRtos::delay_ms(3000);
+                ("brownout", "critical")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_PANIC => {
+                info!("[boot] reset reason: PANIC (stack overflow or abort)");
+                ("panic", "critical")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_INT_WDT => {
+                info!("[boot] reset reason: INT WATCHDOG");
+                ("int_watchdog", "error")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_TASK_WDT => {
+                info!("[boot] reset reason: TASK WATCHDOG");
+                ("task_watchdog", "error")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_WDT => {
+                info!("[boot] reset reason: OTHER WATCHDOG");
+                ("other_watchdog", "error")
+            }
+            r if r == esp_idf_sys::esp_reset_reason_t_ESP_RST_SW => {
+                info!("[boot] reset reason: software reset (OTA or esp_restart)");
+                ("software_reset", "info")
+            }
+            r => {
+                info!("[boot] reset reason: unknown ({})", r);
+                ("unknown", "warning")
+            }
+        };
 
     let btn_screen  = PinDriver::input(peripherals.pins.gpio26, Pull::Up).unwrap();
     let btn_light   = PinDriver::input(peripherals.pins.gpio12, Pull::Up).unwrap();
@@ -314,6 +329,10 @@ fn main() {
     if config::WEB_SERVER_ENABLED {
         web::spawn(Arc::clone(&web_triggers), Arc::clone(&ui_state), Arc::clone(&screen_forced_off), Arc::clone(&lamp_handle), Arc::clone(&auto_rotate), Arc::clone(&led_state));
     }
+
+    // Report boot/reset reason now that wifi is actually up and an HTTP
+    // request can succeed - fire-and-forget, never blocks this thread.
+    api::report_event("boot", boot_severity, format!("device booted, reset reason: {boot_reason}"));
 
     {
         let mut st = ui_state.lock().unwrap();
@@ -826,8 +845,13 @@ fn main() {
 
             if connected != wifi_connected {
                 let screen_on = !screen_forced_off.load(Ordering::Relaxed);
-                if connected { led_state.on_wifi_connect(screen_on); }
-                else         { led_state.on_wifi_disconnect(screen_on); }
+                if connected {
+                    led_state.on_wifi_connect(screen_on);
+                    api::report_event("wifi_recovered", "info", "wifi reconnected".to_string());
+                } else {
+                    led_state.on_wifi_disconnect(screen_on);
+                    api::report_event("wifi_lost", "warning", "wifi disconnected".to_string());
+                }
             }
             if let Ok(mut st) = ui_state.lock() { st.wifi_connected = connected; }
         }

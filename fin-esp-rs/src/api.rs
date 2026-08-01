@@ -90,6 +90,70 @@ fn https_get(url: &str) -> Result<String, String> {
     Err(format!("HTTP failed after {0} retries", config::HTTP_RETRIES))
 }
 
+/// Fire-and-forget device-events report via rabbitmq-sender - runs on its
+/// own thread so a slow/cold/unreachable rabbitmq-sender can never delay
+/// boot or the render loop. Best-effort: logs on failure, never retries
+/// (an occasional dropped boot-event isn't worth the complexity a real
+/// retry loop would add on constrained hardware).
+pub fn report_event(event_type: &'static str, severity: &'static str, message: String) {
+    std::thread::Builder::new()
+        // Matches the plain-HTTP fetch workers' order of magnitude, not the
+        // trivial mic-conn handler (6144B - that one does no HTTP client work
+        // at all, just socket reads). This does JSON serialization + a real
+        // EspHttpConnection round-trip; TLS-free (plain HTTP, LAN-only)
+        // avoids the mbedTLS buffer overhead the 32768B HTTPS fetch workers
+        // need, so a smaller-than-those but larger-than-mic-conn size is safe.
+        .stack_size(16384)
+        .spawn(move || {
+            let payload = serde_json::json!({
+                "queue": "device-events",
+                "message": {
+                    "source": "fin-esp",
+                    "event_type": event_type,
+                    "severity": severity,
+                    "message": message,
+                },
+            });
+            let body = payload.to_string();
+
+            let http_config = HttpConfig {
+                timeout: Some(Duration::from_millis(config::EVENT_REPORT_TIMEOUT_MS)),
+                ..Default::default()
+            };
+
+            let result = (|| -> Result<u16, String> {
+                let mut conn = EspHttpConnection::new(&http_config)
+                    .map_err(|e| format!("conn: {e}"))?;
+                conn.initiate_request(
+                    Method::Post,
+                    config::URL_RABBITMQ_SENDER,
+                    &[
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", &body.len().to_string()),
+                    ],
+                )
+                .map_err(|e| format!("init: {e}"))?;
+                conn.write_all(body.as_bytes()).map_err(|e| format!("write: {e}"))?;
+                conn.initiate_response().map_err(|e| format!("resp: {e}"))?;
+                let status = conn.status();
+                // Drain the response body - matches https_get's own reasoning:
+                // leaving it unread leaks internal HTTP client buffers.
+                let mut buf = [0u8; 256];
+                while conn.read(&mut buf).unwrap_or(0) > 0 {}
+                Ok(status)
+            })();
+
+            match result {
+                Ok(status) if (200..300).contains(&status) => {
+                    info!("[events] reported {event_type}: {status}");
+                }
+                Ok(status) => warn!("[events] {event_type} got HTTP {status}"),
+                Err(e) => warn!("[events] {event_type} failed: {e}"),
+            }
+        })
+        .ok();
+}
+
 pub fn fetch_crypto(data: &mut MarketData) {
     info!("[API] fetching crypto");
     match https_get(config::URL_COINGECKO) {

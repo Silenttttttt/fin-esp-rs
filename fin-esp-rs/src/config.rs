@@ -75,6 +75,12 @@ pub const URL_USDBRL: &str = "https://economia.awesomeapi.com.br/json/last/USD-B
 pub const URL_STOOQ_GOLD: &str = "https://stooq.com/q/l/?s=gc.f&i=d";
 pub const URL_STOOQ_OIL: &str = "https://stooq.com/q/l/?s=cl.f&i=d";
 
+// device-events reporting - plain HTTP (no TLS needed, it's on the LAN),
+// fire-and-forget, short timeout so a slow/cold rabbitmq-sender never
+// delays boot or the render loop.
+pub const URL_RABBITMQ_SENDER: &str = "http://192.168.1.105:30080/send";
+pub const EVENT_REPORT_TIMEOUT_MS: u64 = 3_000;
+
 pub fn url_weather() -> String {
     format!(
         "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,weather_code&timezone=America%2FSao_Paulo",
