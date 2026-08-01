@@ -606,7 +606,9 @@ fn main() {
                     }
                 }
             } else {
-                info!("[btn] screen {}", if web_screen { "web" } else { "physical" });
+                let src = if web_screen { "web" } else { "physical" };
+                info!("[btn] screen {}", src);
+                api::report_event("button_press", "info", format!("screen button ({src})"));
                 if let Ok(mut st) = ui_state.lock() {
                     st.screen = st.screen.next();
                     persist.save_screen(st.screen);
@@ -626,6 +628,7 @@ fn main() {
             last_debounce_light_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] lamp physical");
+            api::report_event("button_press", "info", "lamp button (physical)".to_string());
             let new_on = {
                 let st = ui_state.lock().unwrap();
                 lamp_handle.flip_target(st.lamp.on)
@@ -652,6 +655,13 @@ fn main() {
         if phys_display || web_display {
             last_debounce_display_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
+            // Logged regardless of DISPLAY_TOGGLE_ENABLED below - the physical
+            // press is real activity worth tracking even though the feature
+            // it used to map to is currently a no-op.
+            api::report_event(
+                "button_press", "info",
+                format!("display button ({})", if web_display { "web" } else { "physical" }),
+            );
             // DISABLED (config::DISPLAY_TOGGLE_ENABLED) - screen (LCD) is
             // physically disconnected, so toggling "is the screen forced
             // off" has no real effect. Left in place, not deleted, in case
@@ -674,6 +684,7 @@ fn main() {
             last_debounce_warm_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] warm dim (physical)");
+            api::report_event("button_press", "info", "warm dim button (physical)".to_string());
             lamp_handle.queue_warm_dim();
             if let Ok(mut st) = ui_state.lock() {
                 st.lamp.on    = true;
@@ -695,6 +706,7 @@ fn main() {
             last_debounce_bright_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             info!("[btn] bright white (physical)");
+            api::report_event("button_press", "info", "bright white button (physical)".to_string());
             lamp_handle.queue_bright_white();
             if let Ok(mut st) = ui_state.lock() {
                 st.lamp.on    = true;
@@ -717,6 +729,12 @@ fn main() {
         if phys_pot || web_pot {
             last_debounce_chart_ms = now;
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
+            // Logged regardless of POT_TOGGLE_ENABLED below - see the display
+            // button's identical reasoning above.
+            api::report_event(
+                "button_press", "info",
+                format!("pot button ({})", if web_pot { "web" } else { "physical" }),
+            );
             // DISABLED (config::POT_TOGGLE_ENABLED) - the potentiometer
             // itself is unplugged (too noisy, replaced by the new
             // keyboard's volume scroll wheel), so there's nothing left to
@@ -742,6 +760,10 @@ fn main() {
         if phys_media || web_media {
             last_debounce_media_ms = now;
             info!("[btn] media play/pause ({})", if web_media { "web" } else { "physical" });
+            api::report_event(
+                "button_press", "info",
+                format!("media button ({})", if web_media { "web" } else { "physical" }),
+            );
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             PLAY_PAUSE_READY.store(true, Ordering::Relaxed);
         }
