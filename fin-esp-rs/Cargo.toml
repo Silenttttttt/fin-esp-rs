@@ -15,6 +15,7 @@ aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 cipher = "0.4"
+exprotocol = { path = "/home/silent/Documents/Computarias/esp-protocol/exprotocol-rs" }
 
 [build-dependencies]
 embuild = "0.33"
@@ -22,6 +23,15 @@ embuild = "0.33"
 [profile.release]
 opt-level = "s"
 lto = "thin"
+
+# The main binary stays size-optimized ("s"), but exprotocol's real handshake crypto (ECDH/PoW/
+# AES-GCM via the p256/elliptic-curve crates) was overflowing an explicitly-sized thread stack
+# even at 20-26 KiB -- size optimization deliberately avoids inlining to save flash, which for a
+# deep, heavily-monomorphized generic call chain like elliptic curve field arithmetic means MORE
+# separate stack frames instead of fewer/larger ones. Speed-optimizing just this one dependency
+# should reduce its real stack depth without growing the rest of the binary's flash footprint.
+[profile.release.package.exprotocol]
+opt-level = 3
 
 [profile.dev]
 debug = true

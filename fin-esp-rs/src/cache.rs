@@ -1,11 +1,13 @@
 /// NVS-backed price cache.
 ///
-/// Stores the last known market prices to flash so that the ticker shows real
-/// data immediately on boot rather than dashes until the first API fetch
-/// completes (~10–30 s after WiFi connects).
+/// Stores the last known market prices to flash so that the ticker shows real data immediately
+/// on boot rather than dashes until the first API fetch completes. `save` is only ever called
+/// while `config::PRICE_FETCH_ENABLED` is true (2026-08-30, "we're not even using any of that")
+/// -- `load` still runs unconditionally, so a device that had this enabled before still shows
+/// its last-known values on boot after being switched off.
 ///
-/// Only fields guarded by an ok_* flag are written, so a partial fetch result
-/// never overwrites the cached value for a market that failed.
+/// Only fields guarded by an ok_* flag are written, so a partial fetch result never overwrites
+/// the cached value for a market that failed.
 
 use crate::api::MarketData;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};

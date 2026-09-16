@@ -127,6 +127,13 @@ impl LampHandle {
 
     // ── Public interface ───────────────────────────────────────────────────────
 
+    /// Cheap check for whether `poll()` currently has any real work to do -- lets a caller
+    /// avoid taking a shared network lock around `poll()` on the (overwhelming majority of)
+    /// calls where it would just return `false` immediately anyway.
+    pub fn has_pending_target(&self) -> bool {
+        *self.target.lock().unwrap() != 0
+    }
+
     /// Toggle button: flip between off and on.
     pub fn flip_target(&self, current_displayed_on: bool) -> bool {
         let mut t = self.target.lock().unwrap();
@@ -266,7 +273,12 @@ impl LampHandle {
             return true;
         }
 
-        self.retry_after_ms.store(now_ms().wrapping_add(5_000), Ordering::Relaxed);
+        // Was 5s -- combined with session.rs's old 4s connect_timeout, a cold session
+        // needing even 1-2 failed reconnect attempts before succeeding compounded into the
+        // real ~15-20s felt delay reported live 2026-08-31 ("press once, 15s, press again,
+        // instant"). Tightened alongside session.rs's connect_timeout (now 1s, see that
+        // file's own comment) so a bad cycle costs ~1-1.5s instead of ~5-9s.
+        self.retry_after_ms.store(now_ms().wrapping_add(1_500), Ordering::Relaxed);
         false
     }
 
@@ -294,13 +306,22 @@ impl LampHandle {
     }
 }
 
+/// Finds DPS key 20 (on/off) directly in the raw JSON string instead of building a full
+/// `serde_json::Value` parse tree just to read one boolean -- ported from the same fix in the
+/// standalone `tuya-lan-rs` crate (this module is a vendored copy of it). Matters here
+/// specifically because this runs on every 5-second lamp poll on an already heap-tight device --
+/// avoiding a parse-tree allocation on that hot path is a real, not just theoretical, saving.
 fn parse_dps20(json: &str) -> Option<bool> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let dps20 = v
-        .get("dps")
-        .and_then(|d| d.get("20"))
-        .or_else(|| v.get("data").and_then(|d| d.get("dps")).and_then(|d| d.get("20")));
-    dps20.and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|i| i != 0)))
+    let after = json.find("\"20\":")?;
+    let rest = json[after + 5..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest.get(..end)?.parse::<i64>().ok().map(|n| n != 0)
+    }
 }
 
 fn now_ms() -> u32 {

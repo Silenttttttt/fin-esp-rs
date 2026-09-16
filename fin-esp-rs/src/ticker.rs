@@ -140,8 +140,17 @@ fn build_header(state: &UiState, now_ms: u64) -> [u8; 20] {
     };
     row[4] = SLOT_LAMP;
 
+    // get_date_string() is normally exactly 5 bytes ("DD/MM"), but its
+    // underlying calculation involves unsigned (u64) arithmetic on a value
+    // that starts signed (i64 seconds-since-epoch) - if the system clock
+    // hasn't been set yet (e.g. rendering starts before NTP's first sync
+    // completes, a real window right after boot), that cast can wrap into
+    // a huge value and produce a much longer, garbage date string. This
+    // was previously unbounded (`row[6 + i] = b`) - out of bounds on this
+    // stack-allocated `[u8; 20]` the moment date_str exceeds 14 bytes.
     let date_str = get_date_string();
     for (i, b) in date_str.bytes().enumerate() {
+        if 6 + i >= 20 { break; }
         row[6 + i] = b;
     }
 
@@ -207,14 +216,26 @@ fn build_change_row(state: &UiState) -> [u8; 20] {
             let temp_s = format!("{:.0}", temp);
             let label  = api::wmo_label(code);
             let wlen   = 5 + temp_s.len() + label.len();
-            let wstart = if wlen <= 20 { 20 - wlen } else { 9 };
+            // Was `wstart = 9` whenever wlen > 20 - a FIXED start position
+            // regardless of how long the content actually is. Every write
+            // after the first two used `if wc < 20` as its only guard, but
+            // that only stops a write from CONTINUING past the end - it
+            // never accounted for wstart itself already being too far
+            // right. A long enough temp_s (e.g. a garbage/huge weather_temp
+            // value - NaN, a parse glitch, anything not a normal two-digit
+            // temperature) makes wlen > 20 while wstart stays pinned at 9,
+            // so the very first couple of unguarded writes (SLOT_SUN_CLOUD,
+            // the space after it) could land at wc >= 20 - out of bounds on
+            // this stack-allocated `[u8; 20]`. Clamping wstart directly
+            // bounds every write that follows, unconditionally.
+            let wstart = (if wlen <= 20 { 20 - wlen } else { 9 }).min(19);
             let mut wc = wstart;
-            row[wc] = SLOT_SUN_CLOUD; wc += 1;
-            row[wc] = b' '; wc += 1;
+            if wc < 20 { row[wc] = SLOT_SUN_CLOUD; wc += 1; }
+            if wc < 20 { row[wc] = b' '; wc += 1; }
             for b in temp_s.bytes() { if wc < 20 { row[wc] = b; wc += 1; } }
-            row[wc] = SLOT_DEGREE; wc += 1;
-            row[wc] = b'C'; wc += 1;
-            row[wc] = b' '; wc += 1;
+            if wc < 20 { row[wc] = SLOT_DEGREE; wc += 1; }
+            if wc < 20 { row[wc] = b'C'; wc += 1; }
+            if wc < 20 { row[wc] = b' '; wc += 1; }
             for b in label.bytes() { if wc < 20 { row[wc] = b; wc += 1; } }
         }
     }

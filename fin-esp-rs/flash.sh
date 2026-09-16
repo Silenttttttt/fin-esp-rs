@@ -9,7 +9,13 @@ set -e
 
 ELF="target/xtensa-esp32-espidf/release/fin-esp-rs"
 BIN="/tmp/fin-esp.bin"
-ESPTOOL="$(find .embuild -name esptool.py 2>/dev/null | head -1)"
+# Prefer the python_env venv's esptool.py - it has a real shebang. Other
+# esptool.py copies under .embuild (e.g. esp-idf/*/components/esptool_py/)
+# are shebang-less shims that get misinterpreted as shell scripts if run
+# directly, and plain `find | head -1` picks whichever one the filesystem
+# happens to list first (non-deterministic, bit us once already).
+ESPTOOL="$(find .embuild -path '*/python_env/*' -name esptool.py 2>/dev/null | head -1)"
+if [[ -z "$ESPTOOL" ]]; then ESPTOOL="$(find .embuild -name esptool.py 2>/dev/null | head -1)"; fi
 if [[ -z "$ESPTOOL" ]]; then ESPTOOL="esptool.py"; fi
 
 echo "[1/3] Building..."

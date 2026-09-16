@@ -1,10 +1,55 @@
 # Rust requires a larger main task stack
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Bumped 8192 -> 16384: a real crash was traced to stack corruption in the
+# main task (Guru Meditation StoreProhibited, backtrace resolving into
+# fin_esp_rs::main - see serial console evidence). The main loop now does a
+# lot more per iteration than when 8192 was chosen (7 button handlers each
+# building event-report strings, LCD rendering, LED/wifi bookkeeping) - every
+# other worker thread in this project already runs at 16-32 KB stacks.
+#
+# TRIED AND REVERTED (2026-08-29): bumped 16384 -> 24576 after a real crash
+# (decoded via a real GDB session against a saved core dump -- see
+# project_esp32_heap_budget.md) resolved to a corrupted return address right
+# at `usleep()`'s return into `fin_esp_rs::main`, which looked at the time
+# like the same "main task stack too small" class of problem this constant
+# was raised for once already. Real hardware testing showed the opposite of
+# the intended effect: this device's DRAM budget is tight enough that the
+# extra +8 KiB starved OTHER things instead -- `lampBridge` (the device's
+# core lamp-control function) got stuck in a permanent
+# "Not enough space (os error 12)" spawn-retry loop and NEVER came up,
+# confirmed over 30+ consecutive failed attempts on a fresh boot. That's a
+# worse regression than the rare crash this was meant to fix. Reverted back
+# to 16384. The REAL fix for that crash turned out to be unrelated to stack
+# size at all -- see web.rs's `handle()` for the actual root cause (an
+# oversized default buffer allocation) found the same session, independent
+# of this constant.
+#
+# Retried 2026-08-29, much more modestly this time (16384 -> 18432, +2048, not the +8192 that
+# broke lampBridge above): main_task's own real steady-state stack usage, measured live via
+# uxTaskGetStackHighWaterMark, has consistently been only ~7300-7400 bytes of the 16384 total --
+# the crash this is meant to help with (a real, GDB-decoded, repeatedly-confirmed
+# IllegalInstruction/LoadProhibited crash bottoming in usleep->main->main_task, caused by a rare
+# stack-depth excursion beyond that steady-state baseline reading uninitialized/garbage stack
+# memory) is about a RARE excursion, not chronic tightness -- the stack size itself was never
+# the bottleneck for normal operation, only the HEAP COST of allocating a bigger stack at boot
+# was. Several real heap-freeing fixes landed in this same investigation since the +8192 attempt
+# failed (a real mbedTLS use-after-free bug fixed; a gold+oil TLS-connection-reuse fix cutting
+# one handshake per fetch cycle) -- this modest, much smaller ask is a genuinely different test
+# of whether THIS device's current heap budget can now afford a little more stack margin for
+# this thread specifically, verified carefully on real hardware (lampBridge/Tuya must keep
+# working) before being trusted, exactly like every other change in this file.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=18432
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 
 # Custom partition table (large app, no OTA)
+# Must be an absolute path - ESP-IDF's cmake resolves a relative filename
+# against embuild's synthetic out/ build dir, not the project root, so a
+# plain "partitions.csv" fails with "does not exist". This used to point at
+# a DIFFERENT checkout on this same machine (Fin-ESP, not fin-esp-rs-work),
+# so editing THIS project's partitions.csv silently had no effect on what
+# actually got compiled in. Cost a bricked device (oversized app image vs.
+# stale ota_0/ota_1 sizes) to find - keep this pointed at this checkout.
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/home/silent/Documents/Computarias/Fin-ESP/fin-esp-rs/partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/home/silent/Documents/Computarias/fin-esp-rs-work/fin-esp-rs/partitions.csv"
 
 # Flash size 4MB
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
@@ -17,35 +62,112 @@ CONFIG_ESP_WIFI_PASSWORD="11223344"
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
 # Disable watchdog on idle tasks to avoid false triggers during network I/O
+# main.rs calls esp_task_wdt_reconfigure() at runtime with the real value
+# (45s, see its comment) - kept in sync here so this default isn't
+# misleading about actual behavior.
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=45
 
-# Disable brownout detector entirely.
-# The WiFi radio frontend draws transient current spikes — during PHY init
-# AND during peak TX load (parallel HTTPS fetches) — that dip the supply
-# below any usable detection threshold on this board.  The detector caused
-# an infinite reset loop at every level including the minimum (2.43 V).
-# NVS-backed cache handles data persistence across power cycles, so there
-# is no state worth protecting via brownout detection.
-CONFIG_ESP_BROWNOUT_DET=n
+# Interrupt watchdog - completely separate mechanism from the Task Watchdog
+# above (never touched this one all session). Stock ESP-IDF default is
+# 300ms - fires a hard system reset (rst:0x8 TG1WDT_SYS_RESET) if either
+# core goes 300ms without servicing interrupts/scheduling. Confirmed via
+# serial: this WAS actually firing, fast enough to boot back up between
+# test checks and look like "the connection got reset" rather than an
+# obvious crash - every mic-srv "Connection reset by peer" the daemon hit
+# on nearly every reconnect lines up with this. 300ms is tight for a device
+# already under real heap-fragmentation pressure (see mbedTLS/cert-bundle
+# comments below) doing concurrent WiFi/TCP work; 2000ms gives real margin.
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=2000
+
+# Re-enabling brownout detection at its lowest threshold (2.43V), instead of
+# disabling it outright. It was disabled because it used to loop forever
+# even at this level - but that was measured with full ~20dBm WiFi TX power
+# and concurrent HTTPS fetch workers, both since changed (TX power cut to
+# ~10dBm, fetch workers now run sequentially, smaller TLS buffers/cert
+# bundle). With disabled brownout detection, a real supply sag now runs the
+# chip into an undefined state that just hangs silently - no panic, no
+# reset, nothing on serial - until a hardware EN-pin reset (see esptool)
+# clears it. A clean, self-recovering reset on brownout is strictly better
+# than a hang needing physical/USB-level intervention, even if it costs
+# occasional resets under load. ESP_PHY_REDUCE_TX_POWER makes this
+# self-healing: if a brownout does trip, the NEXT boot automatically drops
+# TX power further, making a repeat less likely instead of looping forever.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+CONFIG_ESP_PHY_REDUCE_TX_POWER=y
 
 # HTTPS / TLS
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# CMN (common CAs only), not FULL: confirmed via serial that even three
+# HTTPS calls run one after another (not concurrent) can fail with
+# "alloc(6825 bytes) failed" despite ~28 KB nominally free - the full
+# certificate bundle's parsing/verification path is heavy enough to
+# fragment the heap badly across repeated calls. CMN halves the bundle size
+# and this device only ever talks to a handful of known hosts (coingecko,
+# awesomeapi.com.br, stooq.com, open-meteo.com), so the full bundle's
+# broader coverage buys nothing here.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
 
 # Shrink mbedTLS record buffers — all API responses are < 2 KB JSON.
-# Default RX=16 KB costs ~30 KB heap per TLS session; 4 KB RX + 2 KB TX
-# cuts that to ~10 KB, so 5 parallel sessions cost ~50 KB instead of ~150 KB.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+# Was 8192/2048 (comment here always claimed 4096, so this had drifted from
+# its own stated intent) - dropped RX back to 4096 to match the real
+# response sizes and further reduce per-connection heap/fragmentation cost.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
-CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+# CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT below is dead: not a real Kconfig
+# option in this ESP-IDF version (v5.4) at all -- confirmed via
+# `grep -rn MBEDTLS_DYNAMIC_FREE_PEER_CERT .embuild/.../components/`, zero
+# matches. Unrecognized sdkconfig keys are silently ignored by the build, so
+# this line does nothing; kept only because removing it isn't worth another
+# flash cycle on its own.
+#
+# TRIED AND REVERTED (2026-08-29): disabling CONFIG_MBEDTLS_DYNAMIC_BUFFER
+# was a real, well-reasoned attempt at fixing a `Guru Meditation Error: Core 0
+# panic'ed (IllegalInstruction)` / EXCVADDR=0x0 crash (see
+# project_esp32_heap_budget.md) that correlated tightly with this exact
+# feature's own `Dynamic Impl: alloc(N bytes) failed` log line. Real hardware
+# testing DISPROVED the hypothesis: the disabled-dynamic-buffer build hit the
+# IDENTICAL crash signature again on its very first boot, AND steady-state
+# free heap dropped further (4-13 KB vs the usual 10-20 KB) with a NEW
+# failure mode (`Failed to initialize new connection object`,
+# `lwip_arch: thread_sem_init: out of memory`) -- static buffers cost more
+# heap up front without removing the crash. Reverted immediately rather than
+# risk regressing ExProtocol's own already-confirmed-working handshake on a
+# fix that doesn't fix anything. The real root cause is still open.
 
 # NTP
 CONFIG_LWIP_SNTP_MAX_SERVERS=1
 
 # Stack overflow detection — canary check on every task switch
 CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+
+# Core dump to flash (see the new `coredump` entry in partitions.csv) — a real, still-open
+# memory-corruption crash (`Guru Meditation Error` / IllegalInstruction / LoadProhibited,
+# backtrace bottoming in fin_esp_rs::main, unrelated to ExProtocol) has so far only been
+# diagnosable via serial log + manual addr2line, which hit a real limit: one occurrence was
+# severe enough that the panic handler's own stack-walk got stuck. A real core dump captures
+# full task-stack + register state at the moment of the crash, decodable offline via
+# `espcoredump.py info_corefile` against this exact ELF -- read after the NEXT occurrence with:
+#   espcoredump.py -p /dev/ttyACM0 info_corefile target/xtensa-esp32-espidf/release/fin-esp-rs
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+
+# TRIED AND REVERTED (2026-08-29): enabled CONFIG_HEAP_POISONING_LIGHT to try to catch a real
+# heap-corruption crash (a `LoadProhibited` inside `tlsf_block_size`, triggered by an innocent
+# LCD I2C write -- see project_esp32_heap_budget.md) at its actual source instead of an unrelated
+# bystander allocation. Real hardware testing showed this device's heap budget has NO room for
+# poisoning's per-allocation overhead at all: with it enabled, the device fell into a genuine,
+# deterministic crash loop, failing IDENTICALLY on every single boot (a DIFFERENT, previously-
+# unseen bare `.unwrap()` panic in api.rs's fetchA/fetchB thread spawn -- see that file, now
+# fixed independently since it's a real bug regardless of poisoning) before ever reaching normal
+# operation. Reverted immediately -- this device cannot afford heap poisoning's overhead, not
+# even the "LIGHT" variant. Do not re-attempt without first freeing significant heap margin
+# elsewhere, and even then, budget for real hardware verification time since this failed
+# catastrophically rather than partially.
+# CONFIG_HEAP_POISONING_LIGHT=y

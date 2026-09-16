@@ -27,14 +27,24 @@ impl Session {
         let addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
         info!("[tuya] connecting to {}:{}", addr, port);
 
+        // Root-caused 2026-09-12: the lamp's cheap embedded Tuya stack accepts exactly ONE
+        // local control connection at a time and silently drops new SYNs (no RST, no SYN-ACK)
+        // for a cooldown period after any recent connection from anyone -- a plain blocking
+        // connect() with no timeout showed attempts hanging for the OS's full ~60s internal
+        // SYN-retry window when they landed inside that window. A long connect_timeout here
+        // was previously left in place from that diagnosis and never brought back down, which
+        // meant every attempt that landed in the cooldown cost a real 4s stall before the
+        // retry loop in mod.rs (1.5s backoff) could try again -- the "massive delay" reported
+        // live 2026-09-15. Shortened back down so a bad attempt fails fast and the next retry
+        // lands sooner: a real LAN connect succeeds in a few ms, so 1s is still generous.
         let stream = TcpStream::connect_timeout(
             &(addr, port).into(),
-            Duration::from_secs(4),
+            Duration::from_millis(1000),
         )
         .map_err(|e| format!("TCP connect: {e}"))?;
 
         stream.set_read_timeout(Some(Duration::from_millis(600))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
 
         info!("[tuya] TCP connected");
 
@@ -160,6 +170,9 @@ impl Session {
             let response = self.receive_raw()?;
             let offset = response.windows(4).position(|w| w == HEAD_55)?;
             let pkt = &response[offset..];
+            if pkt.len() < 16 {
+                return None;
+            }
             let data_len = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]) as usize;
             let start = 20;
             let end = 16 + data_len - 4;
@@ -296,17 +309,29 @@ impl Session {
     }
 }
 
+// Precomputed at compile time -- turns CRC32 from 8 conditional bit-shifts per byte into 1
+// table lookup per byte. Ported from the same fix in the standalone `tuya-lan-rs` crate.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB88320 } else { crc >> 1 };
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
+        let idx = ((crc ^ b as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
     !crc
 }

@@ -2,5 +2,20 @@
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 otadata,  data, ota,     0x10000,  0x2000,
-ota_0,    app,  ota_0,   0x20000,  0x1C0000,
-ota_1,    app,  ota_1,   0x1E0000, 0x1C0000,
+# ota_0's offset (0x20000) and ota_1's offset+size (0x210000/0x1F0000) are unchanged --
+# every flash command in this project hardcodes those two offsets, and ota.rs reads
+# partition info dynamically via esp_ota_get_next_update_partition() rather than any
+# hardcoded size, so neither needed updating. Only ota_0's SIZE shrank (0x1F0000 ->
+# 0x1B0000, 1984 KiB -> 1728 KiB) to free exactly enough room for the new `coredump`
+# partition below -- current binary is ~1438 KiB, so this still leaves ~290 KiB of
+# growth margin, just less generous than before.
+ota_0,    app,  ota_0,   0x20000,  0x1B0000,
+# Added to get a real, analyzable crash dump for the still-open memory-corruption bug
+# (`Guru Meditation Error` / IllegalInstruction / LoadProhibited crashes, backtrace
+# bottoming in fin_esp_rs::main, NOT exprotocol code -- see project_esp32_heap_budget.md)
+# that serial-log-plus-addr2line alone couldn't fully pin down: one occurrence was even
+# severe enough that the panic handler's own stack-walk got stuck, needing a lower-level
+# watchdog to reset the device. 256 KiB comfortably covers an ELF-format coredump
+# (task stacks + summary, not full heap) on this device's RAM budget.
+coredump, data, coredump,0x1D0000, 0x40000,
+ota_1,    app,  ota_1,   0x210000, 0x1F0000,

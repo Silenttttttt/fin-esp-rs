@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// All writes from firmware and web go through this struct.
 /// Hardware is driven by the main loop reading these atomics.
 pub struct LedState {
-    pub green: AtomicBool,
-    pub red:   AtomicBool,
-    pub blue:  AtomicBool,
+    pub green:  AtomicBool,
+    pub red:    AtomicBool,
+    pub yellow: AtomicBool,
 }
 
 impl LedState {
@@ -19,8 +19,8 @@ impl LedState {
             // pressing any button, set on by the web API) - defaulting it
             // on at every boot would misreport a pending message that
             // isn't there, so this now starts false like the others.
-            red:   AtomicBool::new(false),
-            blue:  AtomicBool::new(false),
+            red:    AtomicBool::new(false),
+            yellow: AtomicBool::new(false),
         }
     }
 
@@ -47,7 +47,7 @@ impl LedState {
     /// DISABLED - see on_wifi_connect.
     pub fn on_wifi_disconnect(&self, _screen_on: bool) {}
 
-    pub fn set_green(&self, on: bool) { self.green.store(on, Ordering::Relaxed); }
-    pub fn set_red  (&self, on: bool) { self.red  .store(on, Ordering::Relaxed); }
-    pub fn set_blue (&self, on: bool) { self.blue .store(on, Ordering::Relaxed); }
+    pub fn set_green (&self, on: bool) { self.green .store(on, Ordering::Relaxed); }
+    pub fn set_red   (&self, on: bool) { self.red   .store(on, Ordering::Relaxed); }
+    pub fn set_yellow(&self, on: bool) { self.yellow.store(on, Ordering::Relaxed); }
 }
