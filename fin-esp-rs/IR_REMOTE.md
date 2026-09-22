@@ -7,7 +7,7 @@ saga) lives in `esp32-tests/ir_receiver_test/` in the sibling Fin-ESP repo.
 
 | Button | Action |
 |---|---|
-| **ok** | Toggle lamp on/off |
+| **1** | Toggle lamp on/off |
 | **up** | Brightness up (or color brightness, if a color is active) |
 | **down** | Brightness down (or color brightness, if a color is active) |
 | **left** | Desktop volume down (~7%/press) |
@@ -15,7 +15,7 @@ saga) lives in `esp32-tests/ir_receiver_test/` in the sibling Fin-ESP repo.
 | **\*** | Warm-dim preset |
 | **#** | Bright-white preset |
 | **0** | Media play/pause |
-| **1** | Mirrors the physical black button (GPIO14) — no lamp action, just the flash |
+| **ok** | Mirrors the physical black button (GPIO14) — no lamp action, just the flash |
 | **2** | Lamp color: red |
 | **3** | Lamp color: orange |
 | **4** | Lamp color: yellow-green |

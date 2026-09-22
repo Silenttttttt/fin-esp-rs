@@ -123,10 +123,10 @@ fn step_desktop_volume(delta: i32) {
 }
 
 /// Hue for each digit button's color assignment (full saturation/value for vivid, clearly
-/// distinguishable colors) -- an 8-step rainbow spread, 40 degrees apart. Button 1 (0x45) is
-/// intentionally NOT here -- it mirrors the physical black button (GPIO14) instead, which
-/// does nothing but its own red-LED flash, so button 1 gets no color and no other action,
-/// same as that button. Colors shifted down one slot from the original 9-button assignment.
+/// distinguishable colors) -- an 8-step rainbow spread, 40 degrees apart. Button 1 is now
+/// the lamp toggle (swapped with `ok` 2026-09-22), so it's intentionally NOT here; `ok` mirrors
+/// the physical black button (GPIO14) instead, which does nothing but its own red-LED flash.
+/// Colors shifted down one slot from the original 9-button assignment.
 fn digit_hue(command: u8) -> Option<u16> {
     match command {
         0x46 => Some(0),   // 2: red
@@ -148,12 +148,12 @@ fn digit_hue(command: u8) -> Option<u16> {
 /// remote (bench-tested on identical hardware before this was wired into the real device).
 fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static std::sync::atomic::AtomicBool) {
     match command {
-        0x1C => {
-            // ok -- toggle
+        0x45 => {
+            // 1 (swapped with ok 2026-09-22) -- toggle
             let current_on = lamp_handle.display_state().on;
             lamp_handle.flip_target(current_on);
             IN_COLOUR_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-            info!("[ir] ok -> lamp toggle");
+            info!("[ir] 1 -> lamp toggle");
         }
         0x16 => {
             // *
@@ -201,10 +201,11 @@ fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static st
             play_pause_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             info!("[ir] 0 -> media play/pause");
         }
-        0x45 => {
-            // 1 -- mirrors the physical black button (GPIO14): no lamp action at all,
-            // just the universal red-LED flash every button already gets above.
-            info!("[ir] 1 -> (matches black button: flash only)");
+        0x1C => {
+            // ok (swapped with 1 2026-09-22) -- mirrors the physical black button
+            // (GPIO14): no lamp action at all, just the universal red-LED flash every
+            // button already gets above.
+            info!("[ir] ok -> (matches black button: flash only)");
         }
         _ => {
             // Remaining digit buttons (2-9) each set the lamp to a distinct color -- see
