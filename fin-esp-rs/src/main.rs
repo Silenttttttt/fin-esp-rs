@@ -697,8 +697,20 @@ fn main() {
     let mut last_btn_warm   = true;
     let mut last_btn_bright = true;
     let mut last_btn_chart  = true;
-    let mut last_btn_media  = true;
-    let mut last_debounce_media_ms: u64 = 0;
+    // Real debounce (stable-state, not the shared blanking-period pattern the other
+    // buttons use) -- found live (2026-09-21): the "fire on first edge, then ignore
+    // everything for DEBOUNCE_MS" pattern the other buttons share only blocks a SECOND
+    // trigger within that window; if this specific switch's contact bounce runs past
+    // DEBOUNCE_MS (worn/flaky switch, exactly what was reported: the blue play/pause
+    // button, not the others), the tail end of the same physical press's bounce reads
+    // as a brand new falling edge once the window has already expired -- one press,
+    // two play/pause toggles. This instead requires the raw pin to hold its new value
+    // continuously for the full window before accepting it as real, which filters bounce
+    // no matter how it's distributed in time, at the cost of DEBOUNCE_MS of added latency
+    // that's imperceptible for a play/pause button.
+    let mut media_raw_last      = true;
+    let mut media_raw_since_ms: u64 = 0;
+    let mut media_stable_state  = true;
     // screen_forced_off declared earlier (loaded from NVS)
 
     let mut last_debounce_warm_ms:   u64 = 0;
@@ -1021,12 +1033,21 @@ fn main() {
         }
         last_btn_chart = chart_btn;
 
-        // ── Media play/pause button (GPIO 19, active LOW) ────────────────────
-        let media_btn = btn_media.is_high();
-        let phys_media = last_btn_media && !media_btn && now - last_debounce_media_ms >= config::DEBOUNCE_MS;
+        // ── Media play/pause button (GPIO 27, active LOW) ────────────────────
+        let media_raw = btn_media.is_high();
+        if media_raw != media_raw_last {
+            media_raw_last = media_raw;
+            media_raw_since_ms = now;
+        }
+        let mut phys_media = false;
+        if media_raw != media_stable_state && now - media_raw_since_ms >= config::DEBOUNCE_MS {
+            if media_stable_state && !media_raw {
+                phys_media = true; // confirmed falling edge: button actually pressed
+            }
+            media_stable_state = media_raw;
+        }
         let web_media  = config::WEB_SERVER_ENABLED && web_triggers.media.swap(false, Ordering::Relaxed);
         if phys_media || web_media {
-            last_debounce_media_ms = now;
             info!("[btn] media play/pause ({})", if web_media { "web" } else { "physical" });
             if web_media {
                 let origin = web_triggers.last_origin_external.load(Ordering::Relaxed);
@@ -1039,7 +1060,6 @@ fn main() {
             let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
             PLAY_PAUSE_READY.store(true, Ordering::Relaxed);
         }
-        last_btn_media = media_btn;
 
         // ── Chart auto-exit after 30 s ────────────────────────────────────────
         if chart_active && now >= chart_until {
