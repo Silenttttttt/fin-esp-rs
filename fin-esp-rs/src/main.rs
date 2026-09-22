@@ -8,6 +8,7 @@ mod exprotocol_task;
 mod fmt;
 mod glyphs;
 mod history;
+mod ir_remote;
 mod lcd;
 mod led;
 mod ota;
@@ -416,6 +417,14 @@ fn main() {
 
     // Mic/lamp server — accepts "m:0", "m:1" (mic LED), "l:t" (lamp toggle).
     spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state), Arc::clone(&led_state));
+
+    // IR remote (KY-022 receiver, GPIO4) — bench-tested extensively on identical hardware
+    // before this integration; see esp32-tests/ir_receiver_test/ in the sibling Fin-ESP repo
+    // for the wiring, the button-code capture/verification, and why GPIO4 specifically (not
+    // a boot-strapping pin, unlike GPIO2/5). Dispatches into the same LampHandle/media actions
+    // the physical buttons and web UI already use — a second way to trigger existing
+    // behavior, not a parallel system.
+    ir_remote::spawn_ir_remote_reader(peripherals.pins.gpio4, Arc::clone(&lamp_handle), Arc::clone(&led_state), &PLAY_PAUSE_READY);
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 
@@ -1070,7 +1079,15 @@ fn main() {
         }
 
         // ── Volume potentiometer (GPIO 34, ADC1) ─────────────────────────────
-        if now - last_vol_read_ms >= 10 {
+        // Gated on the SAME flag that already permanently keeps its output out of
+        // VOLUME_PCT (see the comment further down) -- the pot's been physically
+        // disconnected for a long time, so there was no reason left to still spend
+        // 15 ADC reads + the full smoothing pipeline every 10ms (1500 reads/sec) on a
+        // floating pin just for "diagnostics" nobody was looking at. Left the driver/
+        // pin claim itself in place, not deleted, matching this codebase's existing
+        // convention for other disconnected hardware (display/pot toggle buttons) --
+        // trivial to re-enable if the pot's ever reconnected.
+        if config::POT_TOGGLE_ENABLED && now - last_vol_read_ms >= 10 {
             last_vol_read_ms = now;
             // 15-sample trimmed mean of middle 7: rejects extreme ADC outliers.
             let mut s = [0u32; 15];
@@ -1116,7 +1133,8 @@ fn main() {
             // again. Confirmed live: this let real ADC noise off a
             // disconnected pin silently overwrite the real volume,
             // surfacing as "the volume randomly drops" with no user action.
-            if config::POT_TOGGLE_ENABLED && POT_ENABLED.load(Ordering::Relaxed) {
+            // POT_TOGGLE_ENABLED already checked in the outer `if` above.
+            if POT_ENABLED.load(Ordering::Relaxed) {
                 let prev = VOLUME_PCT.load(Ordering::Relaxed);
                 if prev == 255 || (vol as i16 - prev as i16).abs() >= 5 {
                     VOLUME_PCT.store(vol, Ordering::Relaxed);
@@ -1257,7 +1275,7 @@ fn main() {
     }
 }
 
-static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
+pub(crate) static PLAY_PAUSE_READY: AtomicBool = AtomicBool::new(false);
 static VOLUME_PCT: AtomicU8 = AtomicU8::new(255); // 255 = not yet read
 static POT_ENABLED: AtomicBool = AtomicBool::new(true);
 // Which machine's mic last toggled - set by spawn_mic_server, read by every
