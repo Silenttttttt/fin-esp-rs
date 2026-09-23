@@ -77,7 +77,7 @@ pub const WEATHER_MIN_REFRESH_MS: u64 = 600_000;
 pub const AUTO_SCREEN_INTERVAL_MS: u64 = 30_000;
 pub const LOADING_ANIM_MS: u64 = 200;
 pub const LAMP_TOGGLE_ANIM_MS: u64 = 4_000;
-pub const DEBOUNCE_MS: u64 = 50;
+pub const DEBOUNCE_MS: u64 = 100;
 pub const CHART_DURATION_MS: u64 = 30_000;
 
 // Volume potentiometer calibration (raw ADC 0-4095).
