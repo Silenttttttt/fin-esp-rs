@@ -769,6 +769,14 @@ fn handle(
             let json = build_status(ui_state, screen_forced_off, lamp, auto_rotate, leds);
             write_response(&mut s, "200 OK", "application/json", json.as_bytes(), network_lock);
         }
+        // Closed-loop feedback for rust_bench_test's IR transmitter (see ir_remote.rs's
+        // decode_status() doc comment) -- O(1) atomic reads only, no network I/O, safe to poll
+        // as often as that transmitter needs to.
+        ("GET", "/ir/status") => {
+            let (count, key) = crate::ir_remote::decode_status();
+            let body = std::format!("count={count}\nkey={key}\n");
+            write_response(&mut s, "200 OK", "text/plain", body.as_bytes(), network_lock);
+        }
         // Same-origin relay for the Climate chart -- see config::URL_EVENT_DASHBOARD_HISTORY's
         // own comment for why this can't just be a direct cross-origin fetch from the browser.
         // Reads a CACHE only (see dht22::spawn_chart_cache_refresher) -- never makes the actual

@@ -23,6 +23,40 @@ enum IrError {
     ChecksumMismatch,
 }
 
+/// Dedup window for the transmit-side burst-repeat reliability fix (2026-09-26) -- see the
+/// `Ok((address, command))` arm in `spawn_ir_remote_reader`'s loop for why this exists. 1s is
+/// comfortably longer than a 3x300ms-spaced repeat burst (~900ms end to end) while still much
+/// shorter than any realistic human re-press interval, so it can't mask a genuine second press.
+/// Millisecond `u32` + wrapping_sub, not a raw microsecond timestamp -- Xtensa has no native
+/// 64-bit atomics, and this matches the same pattern tuya/mod.rs's own now_ms() already uses.
+const DEDUP_WINDOW_MS: u32 = 300; // shrunk 6500 -> 2000 -> 300 (2026-09-26): rust_bench_test
+                                   // now sends exactly one frame per press (NEC_REPEAT_COUNT=1,
+                                   // see that constant's own comment for why -- single-frame
+                                   // reliability is a measured 100% via the RMT peripheral, and
+                                   // sending more than once is now actively unsafe for any
+                                   // future toggle-type target that lacks this dedup). No burst
+                                   // to size this against anymore -- this window now only
+                                   // guards against a genuine double-detection artifact (an
+                                   // electrical reflection/echo, not a real second press), so it
+                                   // should be short: NEC's own real-remote repeat-code cadence
+                                   // is ~40-110ms, so 300ms comfortably covers that without
+                                   // being anywhere close to a realistic human re-press interval.
+static LAST_DECODED_KEY: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0xFFFF);
+static LAST_DECODED_AT_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Bumped on every successful RAW decode (before the dedup check above), regardless of whether
+// it was a fresh dispatch or a suppressed burst-repeat -- lets a transmitter that's also on the
+// same LAN close the loop over HTTP (see rust_bench_test's own `send_nec_command`) instead of
+// blindly sending a fixed-size burst every time: it can stop as soon as this + the key both
+// confirm its own frame actually landed, cutting typical latency from ~4s down to ~1 frame's
+// worth (~100-300ms) on the (usual) case where reception succeeds quickly.
+static RAW_DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// (count, last decoded (address<<8|command) key) -- polled by `web.rs`'s `/ir/status` route.
+pub fn decode_status() -> (u32, u16) {
+    use std::sync::atomic::Ordering;
+    (RAW_DECODE_COUNT.load(Ordering::Relaxed), LAST_DECODED_KEY.load(Ordering::Relaxed))
+}
+
 fn now_us() -> i64 {
     unsafe { esp_idf_sys::esp_timer_get_time() }
 }
@@ -228,6 +262,24 @@ pub fn spawn_ir_remote_reader(
     led_state: Arc<LedState>,
     play_pause_ready: &'static std::sync::atomic::AtomicBool,
 ) {
+    use esp_idf_hal::cpu::Core;
+    use esp_idf_hal::task::thread::ThreadSpawnConfiguration;
+    // Pinned to Core1 (APP CPU), same reasoning and same fix as dht22.rs's own reader (see that
+    // function's doc comment) -- this thread's read_nec_frame() busy-waits through an entire NEC
+    // frame (header + 32 bits) via wait_while()'s tight, non-yielding spin loop, ~67ms typical and
+    // up to ~110ms on a frame with several near-timeout bits. That's 15-20x longer than dht22's
+    // own ~5ms per read, which was already enough to matter for Core0 (shared with WiFi's driver
+    // task and main_task's physical-button polling) when left unpinned. Bug found live
+    // 2026-09-26: physical buttons occasionally unresponsive for about a second even past
+    // debounce, and this bench-tested remote frequently going undetected entirely (not even a
+    // checksum-mismatch log, meaning the receiver thread often wasn't polling GPIO4 at all during
+    // the ~67ms window a valid frame arrived) -- both symptoms this thread starving Core0 would
+    // explain, and dht22.rs's identical class of bug was already proven and fixed the same way.
+    let _ = ThreadSpawnConfiguration {
+        pin_to_core: Some(Core::Core1),
+        ..Default::default()
+    }
+    .set();
     let spawn_result = std::thread::Builder::new()
         .name("irRemote".into())
         .stack_size(4096)
@@ -243,7 +295,7 @@ pub fn spawn_ir_remote_reader(
             loop {
                 if driver.is_low() {
                     match read_nec_frame(&driver) {
-                        Ok((_address, command)) => {
+                        Ok((address, command)) => {
                             // Same 80ms red-flash acknowledgment the physical buttons
                             // already give on every press -- fires for any successfully
                             // decoded button, including ones not mapped to an action yet,
@@ -252,7 +304,27 @@ pub fn spawn_ir_remote_reader(
                             led_state.set_red(true);
                             std::thread::sleep(Duration::from_millis(80));
                             led_state.set_red(false);
-                            dispatch(command, &lamp_handle, play_pause_ready);
+                            // Real transmit-side reliability fix (2026-09-26): the bench-test
+                            // transmitter now sends each command 3x in a burst to compensate for
+                            // real single-frame loss (same technique real IR remotes use, via
+                            // NEC's own repeat-code convention) -- de-dupe identical
+                            // (address, command) pairs decoded within 1s of each other so a
+                            // burst dispatches exactly once, same as a single clean frame would,
+                            // which matters specifically for the toggle command (0x45): without
+                            // this, 3 successfully-decoded copies would toggle the lamp 3 times.
+                            let key = ((address as u16) << 8) | command as u16;
+                            let now = (now_us() / 1000) as u32;
+                            let last_key = LAST_DECODED_KEY.load(std::sync::atomic::Ordering::Relaxed);
+                            let last_at = LAST_DECODED_AT_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            let is_repeat_of_recent = key == last_key && now.wrapping_sub(last_at) < DEDUP_WINDOW_MS;
+                            LAST_DECODED_KEY.store(key, std::sync::atomic::Ordering::Relaxed);
+                            LAST_DECODED_AT_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+                            RAW_DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if is_repeat_of_recent {
+                                info!("[ir] duplicate within {DEDUP_WINDOW_MS}ms of last decode, skipping dispatch (burst repeat)");
+                            } else {
+                                dispatch(command, &lamp_handle, play_pause_ready);
+                            }
                         }
                         Err(IrError::ChecksumMismatch) => {
                             warn!("[ir] checksum mismatch, dropping frame");
@@ -266,10 +338,22 @@ pub fn spawn_ir_remote_reader(
                     // so we don't immediately re-trigger on our own frame's tail.
                     std::thread::sleep(Duration::from_millis(100));
                 } else {
-                    std::thread::sleep(Duration::from_millis(2));
+                    // Was `sleep(Duration::from_millis(2))` -- real bug found 2026-09-26:
+                    // CONFIG_FREERTOS_HZ=100 here (10ms tick), and a sub-tick sleep request
+                    // rounds UP to at least 1 full tick rather than truncating to 0, so this was
+                    // very likely actually polling every ~10ms, not ~2ms. Against a ~9ms NEC
+                    // header mark, that's a real, serious chance of missing the entire pulse
+                    // between two checks -- consistent with most observed IR failures producing
+                    // zero log output (the header mark never registers at all, read_nec_frame()
+                    // is never even entered, so there's nothing to time out or checksum-fail).
+                    // Now a tight busy-spin instead: safe specifically because this thread is
+                    // pinned to Core1 (see this fn's own core-pinning comment above) and doesn't
+                    // share it with WiFi's driver task or main_task, so spinning here can't starve
+                    // either of them the way it would if this were still on Core0.
                 }
             }
         });
+    let _ = ThreadSpawnConfiguration::default().set();
     if let Err(e) = spawn_result {
         warn!("[ir] thread spawn failed: {e}");
     }
