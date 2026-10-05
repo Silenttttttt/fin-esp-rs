@@ -11,6 +11,7 @@ mod history;
 mod ir_remote;
 mod lcd;
 mod led;
+mod mic_capture;
 mod ota;
 mod persist;
 mod sand;
@@ -425,6 +426,16 @@ fn main() {
     // the physical buttons and web UI already use — a second way to trigger existing
     // behavior, not a parallel system.
     ir_remote::spawn_ir_remote_reader(peripherals.pins.gpio4, Arc::clone(&lamp_handle), Arc::clone(&led_state), &PLAY_PAUSE_READY);
+
+    // INMP441 I2S mic -> continuous raw-PCM push to Jarvis. UNTESTED as of 2026-10-05 -- see
+    // mic_capture.rs's own header for the full reasoning (pin choices, format, transport shape,
+    // and the explicitly-still-open core-pinning question) before touching this.
+    mic_capture::spawn_mic_capture(
+        peripherals.i2s0,
+        peripherals.pins.gpio16,
+        peripherals.pins.gpio17,
+        peripherals.pins.gpio21,
+    );
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 
