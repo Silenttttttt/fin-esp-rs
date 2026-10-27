@@ -442,21 +442,20 @@ var ACL={mode:{cool:'Cool',dry:'Dry (dehumidify)',fan:'Fan only',auto:'Auto',hea
   sv:{swing:'Sweep',highest:'Up',middle:'Middle',lowest:'Down',off:'Fixed'},sh:{auto:'Sweep',off:'Fixed'}};
 var ACQ={mode:'set?mode=',fan:'set?fan=',sv:'swing_v?pos=',sh:'swing_h?pos='};
 function acPost(u){post(u).then(refresh);}
-var AC_BRIDGE="http://192.168.1.105:7319/";
 function acLive(){
-  fetch(AC_BRIDGE,{mode:'cors'}).then(function(r){return r.json()}).then(function(a){
+  fetch('/ac/cloud').then(function(r){return r.json()}).then(function(a){
     var el=document.getElementById('aclive');
-    if(!a||!a.available){el.className='ac-live';return;}
+    var live=a&&a.mqtt&&a.mqtt.connected&&a.ac;
+    if(!live){el.className='ac-live';return;}
+    var d=a.ac;
     function row(l,v){return v===null||v===undefined||v===''?'':'<span><span class="lbl">'+l+'</span> <b>'+v+'</b></span>';}
     el.innerHTML=
-      row('Room',a.room_temp_c!=null?a.room_temp_c+'\u00B0':'')+
-      row('Outside',a.outdoor_temp_c!=null?a.outdoor_temp_c+'\u00B0':'')+
-      row('Coil',a.outdoor_coil_c!=null?a.outdoor_coil_c+'\u00B0':'')+
-      row('State',a.running)+
-      row('Power',a.power_draw!=null?a.power_draw+'W':'')+
-      row('Fan',a.fan_rpm?a.fan_rpm+'rpm':'')+
-      row('EEV',a.eev)+
-      row('Err',a.error_code&&a.error_code!=='0'?a.error_code:'');
+      row('Room',d.room_c!=null?d.room_c+'\u00B0':'')+
+      row('Outside',d.outdoor_c!=null?d.outdoor_c+'\u00B0':'')+
+      row('Coil',d.odu_coil_c!=null?d.odu_coil_c+'\u00B0':'')+
+      row('Compressor',d.compressor_hz?d.compressor_hz+'Hz':(d.power?'running':'idle'))+
+      row('EEV',d.eev)+
+      row('Err',d.error&&d.error!=='0'&&d.error!==0?d.error:'');
     el.className='ac-live on';
   }).catch(function(){document.getElementById('aclive').className='ac-live';});
 }
@@ -956,6 +955,21 @@ fn handle(
             lamp.queue_colour(hue, sat, val);
             if let Ok(mut st) = ui_state.lock() { st.lamp.on = true; st.lamp.known = true; }
             ok(&mut s, network_lock);
+        }
+        // ── LG AC local cloud (ac_cloud/): status + runtime kill switch ──
+        ("GET", "/ac/cloud") => {
+            let json = crate::ac_cloud::status_json();
+            write_response(&mut s, "200 OK", "application/json", json.as_bytes(), network_lock);
+        }
+        ("POST", "/action/ac/cloud") => {
+            match get_param_str(query, "on") {
+                Some(v @ ("0" | "1")) if crate::ac_cloud::set_enabled(v == "1") => {
+                    write_response(&mut s, "200 OK", "text/plain",
+                        if v == "1" { b"ac_cloud enabled (persisted; takes effect at next boot if it was off)" as &[u8] } else { b"ac_cloud stopped + disabled (persisted)" },
+                        network_lock);
+                }
+                _ => write_response(&mut s, "400 Bad Request", "text/plain", b"need on=0|1", network_lock),
+            }
         }
         // ── LG AC (see ac.rs: state changes only, its own thread does the IR send) ──
         ("GET", "/ac/state") => {

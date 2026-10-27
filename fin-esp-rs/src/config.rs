@@ -213,9 +213,16 @@ pub const DHT22_ENABLED: bool = false;
 // the bench-test board (rust_bench_test, a separate project) is the one with a real mic today.
 pub const FIN_ESP_MIC_ENABLED: bool = false;
 
-/// Fin-ESP acts as the LG AC's local cloud (see ac_cloud.rs). Disabled until each stage is proven
-/// stable — it adds a TLS handshake to a memory-tight, OOM-prone board.
-pub const AC_CLOUD_ENABLED: bool = false;
+/// Fin-ESP acts as the LG AC's local cloud (see src/ac_cloud/). Adds a TLS handshake to a
+/// memory-tight, OOM-prone board, so it is heap-gated and has a runtime kill switch
+/// (POST /action/ac/cloud?on=0, persisted). Enabled 2026-10-27 for bench testing: listening only
+/// changes nothing for the AC, which keeps using the desktop rethink until DNS is re-pointed.
+pub const AC_CLOUD_ENABLED: bool = true;
+/// Hostname Fin-ESP advertises in GET /route (apiServer https://<h>:443, mqttServer ssl://<h>:8883).
+/// Same name the desktop rethink advertises today (AdGuard rewrite -> desktop .105), so cutting the
+/// AC over = re-pointing that ONE DNS rewrite at Fin-ESP (.240), and reverting = pointing it back.
+/// Fin-ESP's TLS leaf cert (certs/ac_server.cert) carries this name in its SAN.
+pub const AC_CLOUD_HOSTNAME: &str = "rethink.internal";
 // Crypto/gold/oil/USD-BRL price fetching - disabled per direct request 2026-08-30
 // ("we're not even using any of that"), same "kept, not removed" pattern as the flags above so
 // it can come back with one flip if that changes. When false, main.rs never spawns the finFetch

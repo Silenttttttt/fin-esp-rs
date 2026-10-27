@@ -456,7 +456,6 @@ fn main() {
     // the safe direction; the onboard blue LED on GPIO2 flickers with each send) -- Fin-ESP is the AC's only controller, see
     // ac.rs's header. Loads persisted state, never transmits on boot.
     ac::spawn(peripherals.rmt.channel0, peripherals.pins.gpio2, persist.clone());
-    if config::AC_CLOUD_ENABLED { ac_cloud::spawn(); }
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 
@@ -678,6 +677,12 @@ fn main() {
             }
         }
     }
+
+    // LG AC local cloud (ac_cloud/): HTTPS /route + 1-client MQTTS broker + clip/TLV decode, so the
+    // AC's ThinQ "cloud" can live on Fin-ESP instead of the desktop rethink. Spawned LAST, after
+    // lamp/IR/web/OTA are all up; its worker thread (and stack) is only created 45 s later, by a
+    // small launcher. No-op unless config::AC_CLOUD_ENABLED (and not switched off at runtime via NVS).
+    ac_cloud::spawn(Arc::clone(&network_lock), persist.clone());
 
     // ── Watchdog: subscribe main task, trigger panic (→ reset) if loop stalls ──
     // 45s, not 30s: fetch_all's two workers now run sequentially (see

@@ -153,4 +153,18 @@ impl Persist {
             let _ = n.set_u32("ac_state", v);
         }
     }
+
+    /// AC-cloud runtime kill switch (ac_cloud.rs). true = don't start it even if compiled enabled.
+    pub fn load_ac_cloud_off(&self) -> bool {
+        self.open()
+            .and_then(|mut n| n.get_u8("acc_off").ok().flatten())
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
+    pub fn save_ac_cloud_off(&self, v: bool) {
+        if let Some(mut n) = self.open() {
+            let _ = n.set_u8("acc_off", v as u8);
+        }
+    }
 }

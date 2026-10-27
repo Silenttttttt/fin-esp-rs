@@ -171,3 +171,10 @@ CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 # elsewhere, and even then, budget for real hardware verification time since this failed
 # catastrophically rather than partially.
 # CONFIG_HEAP_POISONING_LIGHT=y
+
+# AC local cloud (src/ac_cloud/, 2026-10-27): adds two listeners (:443 HTTPS /route, :8883 MQTTS)
+# plus up to one MQTT session and one short HTTPS request on top of the existing 4 listeners
+# (web 80, OTA 3232, media 9876, mic 9877), the Tuya lamp session, web/media/mic clients and the
+# on-demand weather fetch -- that can exceed the default 10. A socket slot is ~a few dozen bytes
+# of static table (pcbs/netconns are allocated on demand), so 16 costs effectively nothing.
+CONFIG_LWIP_MAX_SOCKETS=16

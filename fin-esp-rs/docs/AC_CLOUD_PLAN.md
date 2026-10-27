@@ -1,5 +1,12 @@
 # Lean AC-cloud on the ESP32 — build plan
 
+> **As built (2026-10-27):** Stages A (HTTPS /route), B (1-client MQTTS broker) and C (clip + TLV
+> decode, read-only) are implemented in `src/ac_cloud/` and verified on the live Fin-ESP against a
+> scripted fake AC replaying real captured frames. The real AC still talks to the desktop rethink;
+> cutover (re-pointing the `rethink.internal` DNS rewrite to 192.168.1.240) awaits Muni's OK.
+> Live status: `GET http://192.168.1.240/ac/cloud`. Kill switch: `POST /action/ac/cloud?on=0`.
+> Progress log: ~/Documents/Computarias/lean-ac-cloud/esp-cloud/PROGRESS.md.
+
 Goal: the AC's fake-ThinQ-cloud runs **entirely on an ESP32** (Fin-ESP is viable: 66 KB free / 52 KB
 min measured; or a dedicated board). No desktop, no rethink. Path B (tuned TLS — the AC forces TLS,
 confirmed 10-27). Zero AC risk: reimplements only the server; the AC firmware is never touched.

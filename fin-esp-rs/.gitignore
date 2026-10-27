@@ -1,2 +1,5 @@
 subprocess
 sys
+
+# Fin-ESP AC-cloud TLS server private key (leaf signed by rethink CA) -- local only, never commit
+certs/ac_server.key

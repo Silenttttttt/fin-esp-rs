@@ -15,7 +15,6 @@
  */
 
 import { z } from "zod";
-import mqtt from "mqtt";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
@@ -289,64 +288,45 @@ server.registerTool(
   async () => text(await post("/action/ac/resend")),
 );
 
-// ── LG AC real state via rethink (READ-ONLY, over the local MQTT broker) ─────────────────────
-// rethink (the local fake-ThinQ-cloud server) decodes the AC's real two-way state and publishes it
-// to a localhost MQTT broker. This reads those retained topics on demand. It NEVER writes to the AC
-// or to MQTT. If rethink/MQTT isn't running, it returns a clear "unavailable" note.
-const RETHINK_MQTT = process.env.RETHINK_MQTT_URL ?? "mqtt://127.0.0.1:1883";
-
-function readRethinkState(timeoutMs = 1500) {
-  return new Promise((resolve) => {
-    let client;
-    const topics = {};
-    const done = (err) => {
-      try { client && client.end(true); } catch {}
-      resolve({ err, topics });
-    };
-    try {
-      client = mqtt.connect(RETHINK_MQTT, { connectTimeout: timeoutMs, reconnectPeriod: 0 });
-    } catch (e) { return done(String(e)); }
-    client.on("error", (e) => done(String(e.message || e)));
-    client.on("connect", () => client.subscribe("rethink/#", (e) => e && done(String(e))));
-    client.on("message", (t, p) => { topics[t] = p.toString(); });
-    // retained messages arrive right after subscribe; collect briefly then finish
-    setTimeout(() => done(null), Math.min(timeoutMs, 1200));
-  });
-}
+// ── LG AC real state, directly from Fin-ESP's own ac_cloud module (READ-ONLY) ────────────────
+// As of 2026-10-27 the AC connects directly to Fin-ESP (no desktop rethink/MQTT in the loop at
+// all — see fin-esp-rs/src/ac_cloud/). This just GETs Fin-ESP's own /ac/cloud status endpoint.
+// It NEVER writes to the AC. Returns a clear "unavailable" note if Fin-ESP's cloud listener or the
+// AC's own connection to it isn't up.
+const MODE_NAMES = ["cool", "dry", "fan", "heat", "auto"]; // index matches the TLV 0x1f9 enum used on-device
 
 server.registerTool(
   "lg_ac_live",
   {
-    title: "AC real state (two-way, via rethink)",
+    title: "AC real state (two-way, direct to Fin-ESP)",
     description:
-      "The air conditioner's REAL state and sensors, read from its own WiFi reporting through the local rethink " +
-      "server: room temperature, outdoor temperature, actual on/off & mode, live power draw, fan, swing, timers, " +
-      "filter, error code, etc. This is genuine readback from the AC (unlike the IR tools, which only track what " +
-      "Fin-ESP last sent). Read-only; nothing is sent to the AC. Returns a note if rethink isn't running.",
+      "The air conditioner's REAL state and sensors, read directly from Fin-ESP (which is itself the AC's cloud " +
+      "endpoint — no PC/desktop involved). Includes room temperature, outdoor temperature, actual on/off & mode, " +
+      "compressor Hz, EEV opening, error code. This is genuine two-way readback from the AC over its own WiFi " +
+      "(unlike the IR tools, which only track what Fin-ESP last SENT over IR). Read-only; nothing is written to " +
+      "the AC. Returns available:false if the AC hasn't connected to Fin-ESP's cloud listener yet.",
     inputSchema: {},
     annotations: readOnly,
   },
   async () => {
-    const { err, topics } = await readRethinkState();
-    if (err || Object.keys(topics).length === 0)
-      return text(JSON.stringify({ available: false, note: "rethink/MQTT not reachable — IR tools still work", error: err || "no data" }));
-    const dev = Object.keys(topics).map((t) => t.split("/")[1]).find((x) => /^[0-9a-f]{8}-[0-9a-f-]+$/.test(x));
-    const g = (k) => topics[`rethink/${dev}/${k}`] ?? topics[`rethink/${dev}/${k}-`];
-    const num = (k) => { const v = g(k); return v == null ? null : (isNaN(+v) ? v : +v); };
+    let cloud;
+    try {
+      cloud = JSON.parse(await get("/ac/cloud"));
+    } catch (e) {
+      return text(JSON.stringify({ available: false, note: "Fin-ESP /ac/cloud unreachable — IR tools still work", error: String(e.message || e) }));
+    }
+    if (!cloud.mqtt?.connected || !cloud.ac) {
+      return text(JSON.stringify({ available: false, note: "ac_cloud listener is up but the AC isn't connected to it right now", enabled: cloud.enabled, phase: cloud.phase }));
+    }
+    const a = cloud.ac;
     const state = {
-      available: true, device: dev,
-      on: g("climate-mode") && g("climate-mode") !== "off",
-      mode: g("climate-mode"), running: g("climate-action"),
-      target_temp_c: num("climate-temperature"),
-      room_temp_c: num("climate-current_temperature"),
-      outdoor_temp_c: num("oduairtemp"), outdoor_coil_c: num("oduhextemp"),
-      fan: g("climate-fan_mode"), swing: g("climate-swing_mode"),
-      power_draw: num("energy_current"), capacity_kw: num("capacity"),
-      eev: num("eev"), outdoor_fan_rpm: num("fanrpm"),
-      jet: g("jet"), soft_air: g("softair"), energy_limit: g("energylimit"),
-      auto_clean: g("autodrysetting"), beep: g("beep"),
-      sleep_timer: num("sleeptimer"), off_timer: num("stoptimer"), on_timer: num("starttimer"),
-      error_code: g("error"), filter_used_h: num("filterused"), filter_life_h: num("filterlife"),
+      available: true, device: cloud.clip?.did, model: cloud.clip?.model,
+      on: !!a.power, mode: MODE_NAMES[a.mode] ?? a.mode,
+      target_temp_c: a.target_c, room_temp_c: a.room_c,
+      outdoor_temp_c: a.outdoor_c, outdoor_coil_c: a.odu_coil_c,
+      compressor_hz: a.compressor_hz, eev: a.eev, fan_rpm_raw: a.fan_rpm_raw,
+      error_code: a.error,
+      connected_s: cloud.mqtt.connected_s, last_frame_s_ago: cloud.clip?.last_frame_s_ago,
     };
     return text(JSON.stringify(state, null, 2));
   },
