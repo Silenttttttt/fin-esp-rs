@@ -338,6 +338,35 @@ fn closed_loop(persist: &Persist) {
     if !matches(&rb) {
         adopt(&rb, persist);
     }
+    adopt_extras(&rb, persist);
+}
+
+/// 2026-10-27 (Muni: "these dont seem to match"): swing, auto-clean and max power used to show only
+/// what Fin-ESP last sent over IR, unconfirmed. The AC reports them over WiFi (rethink
+/// RAC_056905_WW): 0x321 vertical vane (0 fixed, 100 swing, 1-6 top..bottom), 0x322 horizontal
+/// (0 fixed, 100 swing), 0x20e auto-dry setting (0/255), 0x20d power limit % (0 = no limit).
+/// Each is adopted only while nothing for it is still waiting to be sent.
+fn adopt_extras(rb: &crate::ac_cloud::Readback, persist: &Persist) {
+    let before = pack();
+    if !PENDING_SWING_V.load(Ordering::Relaxed) {
+        let idx = match rb.swing_v { Some(0) => Some(0), Some(100) => Some(1), Some(p @ 1..=6) => Some(p as u8 + 1), _ => None };
+        if let Some(i) = idx { SWING_V_IDX.store(i, Ordering::Relaxed); }
+    }
+    if !PENDING_SWING_H.load(Ordering::Relaxed) {
+        match rb.swing_h { Some(0) => SWING_H_IDX.store(0, Ordering::Relaxed), Some(100) => SWING_H_IDX.store(1, Ordering::Relaxed), _ => {} }
+    }
+    if !PENDING_AUTO_CLEAN.load(Ordering::Relaxed) {
+        match rb.auto_dry { Some(0) => AUTO_CLEAN.store(false, Ordering::Relaxed), Some(255) => AUTO_CLEAN.store(true, Ordering::Relaxed), _ => {} }
+    }
+    if !PENDING_POWER_LIMIT.load(Ordering::Relaxed) {
+        let pct = match rb.power_limit { Some(0) => Some(100u8), Some(p) => Some(p as u8), None => None };
+        if let Some(i) = pct.and_then(|p| POWER_LIMITS.iter().position(|(x, _)| *x == p)) { POWER_LIMIT.store(i as u8, Ordering::Relaxed); }
+    }
+    if pack() != before {
+        ADOPTED.fetch_add(1, Ordering::Relaxed);
+        info!("[ac] airflow/settings corrected from the AC's own report: {}", state_json());
+        persist.save_ac_state(pack());
+    }
 }
 
 // ── State changes (any thread, never block) ──────────────────────────────────
@@ -365,7 +394,17 @@ pub fn sleep_in(minutes: u32) -> bool {
     if now < 1_700_000_000 { return false; }
     OFF_AT.store(now + minutes.min(24 * 60) * 60, Ordering::Relaxed);
     SLEEP_DIRTY.store(true, Ordering::Relaxed);
+    power_on_if_off();
     true
+}
+
+/// 2026-10-27 (Muni: "pressing all the buttons while its off, should turn it on"): every AC
+/// control, not just mode/temp/fan, switches the AC on with its current settings first.
+fn power_on_if_off() {
+    if !POWER.load(Ordering::Relaxed) {
+        POWER.store(true, Ordering::Relaxed);
+        mark_main();
+    }
 }
 static SLEEP_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -384,20 +423,23 @@ fn sleep_poll(persist: &Persist) {
     }
 }
 
-/// Blue button: off -> on in cool at BUTTON_ON_TEMP; on -> off. Returns the new power state.
+/// Blue button / IR remote "7" / web dashboard power button: pure toggle, off -> on keeping the
+/// current mode/temp/fan, on -> off. Returns the new power state.
 ///
-/// 2026-10-27 (Muni: "it should be toggle on and off"): a pure power toggle now. It flips the AC's
-/// REAL power as reported over WiFi (Fin-ESP's own flag could be stale after a missed frame, which
-/// made a press meant as "off" come out as "on at 21C"), unless a change is still in flight, in
-/// which case it flips that requested state. Turning on keeps the current mode/temp/fan.
+/// 2026-10-27, root-caused live (Muni: "it just goes to whatever state... we need the state fully
+/// tracked on the esp, so that it never goes out of sync"): this used to flip the AC's REAL power
+/// as reported over WiFi instead of Fin-ESP's own POWER flag, to cover a real gap -- Fin-ESP's flag
+/// could go stale forever after a missed IR frame (IR has no feedback). That's no longer the right
+/// fix: the closed-loop verifier above (closed_loop/adopt) already self-corrects POWER from the
+/// AC's own report within ~12s of any missed/failed send, safely (only once quiet and nothing is
+/// pending). Reading LIVE readback here instead raced against that: two toggles close together (a
+/// real pattern in the device-events log -- physical/IR/web presses landing within milliseconds of
+/// each other) could both read the SAME pre-update readback and compute the SAME target, silently
+/// cancelling one of the presses or landing on the wrong state. Fin-ESP's own POWER is updated the
+/// instant ANY path (button, IR, web) requests a change, with zero WiFi round-trip -- it IS already
+/// the single, always-current source of truth; consulting anything else here was the bug.
 pub fn button_toggle() -> bool {
-    let in_flight = PENDING_MAIN.load(Ordering::Relaxed) || VERIFY.load(Ordering::Relaxed) == V_WAITING;
-    let current = if in_flight {
-        POWER.load(Ordering::Relaxed)
-    } else {
-        crate::ac_cloud::readback().map(|r| r.power).unwrap_or(POWER.load(Ordering::Relaxed))
-    };
-    let on = !current;
+    let on = !POWER.load(Ordering::Relaxed);
     set_power(on);
     on
 }
@@ -428,14 +470,14 @@ pub fn step_temp(delta: i32) {
 
 pub fn set_swing_v(name: &str) -> bool {
     match SWING_V.iter().position(|(n, _)| *n == name) {
-        Some(i) => { SWING_V_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_V.store(true, Ordering::Relaxed); true }
+        Some(i) => { SWING_V_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_V.store(true, Ordering::Relaxed); power_on_if_off(); true }
         None => false,
     }
 }
 
 pub fn set_swing_h(name: &str) -> bool {
     match SWING_H.iter().position(|(n, _)| *n == name) {
-        Some(i) => { SWING_H_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_H.store(true, Ordering::Relaxed); true }
+        Some(i) => { SWING_H_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_H.store(true, Ordering::Relaxed); power_on_if_off(); true }
         None => false,
     }
 }
@@ -456,7 +498,7 @@ pub fn preset(name: &str) -> bool {
 }
 
 /// Any of the three may be None (unchanged). power_limit must be one of POWER_LIMITS' percents.
-/// Sent while the AC is on; if it's off they wait and go out after the next power-on.
+/// Turns the AC on if it's off; the settings go out once the AC has confirmed it's on.
 pub fn set_features(auto_clean: Option<bool>, energy_saving: Option<bool>, power_limit: Option<u8>) -> bool {
     let limit_idx = match power_limit {
         Some(p) => match POWER_LIMITS.iter().position(|(pct, _)| *pct == p) { Some(i) => Some(i as u8), None => return false },
@@ -466,6 +508,7 @@ pub fn set_features(auto_clean: Option<bool>, energy_saving: Option<bool>, power
     if let Some(v) = energy_saving { ENERGY_SAVING.store(v, Ordering::Relaxed); PENDING_ENERGY_SAVING.store(true, Ordering::Relaxed); }
     if let Some(i) = limit_idx { POWER_LIMIT.store(i, Ordering::Relaxed); PENDING_POWER_LIMIT.store(true, Ordering::Relaxed); }
     LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
+    power_on_if_off();
     true
 }
 
@@ -473,6 +516,7 @@ pub fn set_features(auto_clean: Option<bool>, energy_saving: Option<bool>, power
 pub fn show_power() {
     LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
     PENDING_SHOW_POWER.store(true, Ordering::Relaxed);
+    power_on_if_off();
 }
 
 /// Re-send the full state (main frame, airflow and AC settings) to re-normalize the AC.
@@ -829,13 +873,17 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                     }
                 }
                 let on_now = POWER.load(Ordering::Relaxed);
-                let settings_pending = on_now && (PENDING_AUTO_CLEAN.load(Ordering::Relaxed)
+                // Airflow and AC-setting frames are IR-only. They go out only while the AC is on and no
+                // main change is still waiting for the AC's confirmation -- so a press while off first
+                // turns the AC on (over WiFi, ~1 s) and the setting follows once it's really on.
+                let extras_ready = on_now && VERIFY.load(Ordering::Relaxed) != V_WAITING;
+                let settings_pending = extras_ready && (PENDING_AUTO_CLEAN.load(Ordering::Relaxed)
                     || PENDING_ENERGY_SAVING.load(Ordering::Relaxed)
                     || PENDING_POWER_LIMIT.load(Ordering::Relaxed)
-                    || PENDING_SHOW_POWER.load(Ordering::Relaxed));
-                let any = settings_pending || PENDING_JET.load(Ordering::Relaxed) || PENDING_MAIN.load(Ordering::Relaxed)
+                    || PENDING_SHOW_POWER.load(Ordering::Relaxed)
                     || PENDING_SWING_V.load(Ordering::Relaxed)
-                    || PENDING_SWING_H.load(Ordering::Relaxed);
+                    || PENDING_SWING_H.load(Ordering::Relaxed));
+                let any = settings_pending || PENDING_JET.load(Ordering::Relaxed) || PENDING_MAIN.load(Ordering::Relaxed);
                 if !any || now_ms().wrapping_sub(LAST_CHANGE_MS.load(Ordering::Relaxed)) < SETTLE_MS as u32 {
                     continue;
                 }
@@ -867,11 +915,12 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                     frames.push(LG_JET);
                     jet_sent = true;
                 }
-                let on = POWER.load(Ordering::Relaxed);
-                if PENDING_SWING_V.swap(false, Ordering::Relaxed) && on {
+                // A main change that just went over WiFi isn't confirmed yet: extras wait for the next cycle.
+                let on = extras_ready && !via_wifi;
+                if on && PENDING_SWING_V.swap(false, Ordering::Relaxed) {
                     frames.push(SWING_V[SWING_V_IDX.load(Ordering::Relaxed) as usize % SWING_V.len()].1);
                 }
-                if PENDING_SWING_H.swap(false, Ordering::Relaxed) && on {
+                if on && PENDING_SWING_H.swap(false, Ordering::Relaxed) {
                     frames.push(SWING_H[SWING_H_IDX.load(Ordering::Relaxed) as usize % SWING_H.len()].1);
                 }
                 // AC settings only go out while it's on; otherwise they stay pending for the next on.
@@ -884,7 +933,7 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 if on && PENDING_POWER_LIMIT.swap(false, Ordering::Relaxed) {
                     frames.push(POWER_LIMITS[POWER_LIMIT.load(Ordering::Relaxed) as usize % POWER_LIMITS.len()].1);
                 }
-                if PENDING_SHOW_POWER.swap(false, Ordering::Relaxed) && on {
+                if on && PENDING_SHOW_POWER.swap(false, Ordering::Relaxed) {
                     frames.push(LG_SHOW_POWER);
                 }
                 if DUTY_DIRTY.swap(false, Ordering::Relaxed) {

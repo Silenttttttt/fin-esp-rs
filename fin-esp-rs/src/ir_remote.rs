@@ -173,17 +173,16 @@ fn step_desktop_volume(delta: i32) {
 /// distinguishable colors) -- an 8-step rainbow spread, 40 degrees apart. Button 1 is now
 /// the lamp toggle (swapped with `ok` 2026-09-22), so it's intentionally NOT here; `ok` mirrors
 /// the physical black button (GPIO14) instead, which does nothing but its own red-LED flash.
-/// Colors shifted down one slot from the original 9-button assignment.
+/// Colors shifted down one slot from the original 9-button assignment. 2026-10-27 (Muni): the
+/// 7/8/9 colors moved up to 4/5/6, replacing yellow-green/green/teal; 7/8/9 now control the AC
+/// (see dispatch()).
 fn digit_hue(command: u8) -> Option<u16> {
     match command {
         0x46 => Some(0),   // 2: red
         0x47 => Some(40),  // 3: orange
-        0x44 => Some(80),  // 4: yellow-green
-        0x40 => Some(120), // 5: green
-        0x43 => Some(160), // 6: teal
-        0x07 => Some(200), // 7: cyan-blue
-        0x15 => Some(240), // 8: blue
-        0x09 => Some(280), // 9: purple
+        0x44 => Some(200), // 4: cyan-blue
+        0x40 => Some(240), // 5: blue
+        0x43 => Some(280), // 6: purple
         _ => None,
     }
 }
@@ -239,6 +238,22 @@ fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static st
             // 0 -- moved here from 5
             play_pause_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             info!("[ir] 0 -> media play/pause");
+        }
+        0x07 => {
+            // 7 -- AC on/off, same as the blue button (toggles the AC's real power)
+            let on = crate::ac::button_toggle();
+            info!("[ir] 7 -> AC {}", if on { "on" } else { "off" });
+            crate::api::report_event("button_press", "info", std::format!("AC {} (IR remote 7)", if on { "on" } else { "off" }), "ir_remote");
+        }
+        0x15 => {
+            // 8 -- AC colder (turns it on if it's off)
+            crate::ac::step_temp(-1);
+            info!("[ir] 8 -> AC colder");
+        }
+        0x09 => {
+            // 9 -- AC warmer (turns it on if it's off)
+            crate::ac::step_temp(1);
+            info!("[ir] 9 -> AC warmer");
         }
         0x1C => {
             // ok (swapped with 1 2026-09-22) -- mirrors the physical black button

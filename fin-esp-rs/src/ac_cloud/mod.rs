@@ -650,6 +650,10 @@ pub struct Readback {
     pub mode: u32,
     pub fan: Option<u32>,
     pub target_half: Option<u32>,
+    pub swing_v: Option<u32>,
+    pub swing_h: Option<u32>,
+    pub auto_dry: Option<u32>,
+    pub power_limit: Option<u32>,
 }
 
 /// A TLV frame must have arrived this recently for the readback to count as live. The AC pushes
@@ -675,6 +679,10 @@ pub fn readback() -> Option<Readback> {
             mode: m,
             fan: sh.regs.get(0x1fa),
             target_half: sh.regs.get(0x1fe),
+            swing_v: sh.regs.get(0x321),
+            swing_h: sh.regs.get(0x322),
+            auto_dry: sh.regs.get(0x20e),
+            power_limit: sh.regs.get(0x20d),
         });
     });
     out

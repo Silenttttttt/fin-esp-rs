@@ -174,10 +174,11 @@ button:active{opacity:.72;transform:scale(.96)}
 .ac-row{display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.4rem}
 .ac-row .sl-l{width:5.2rem;padding-top:.3rem;flex-shrink:0}
 .card.cold{box-shadow:0 0 50px -14px rgba(56,189,248,.35),inset 0 1px 0 rgba(255,255,255,.04)}
-.ac-st{margin-left:auto;margin-right:.3rem;padding:.15rem .6rem;border-radius:999px;font-size:.7rem;font-weight:700;
-  letter-spacing:.08em;background:#1a1a30;color:var(--dim);border:1px solid var(--bd)}
-.ac-st+.sw{margin-left:0}
-.ac-st.on{background:rgba(34,197,94,.14);color:var(--up);border-color:rgba(34,197,94,.45);box-shadow:0 0 10px rgba(34,197,94,.25)}
+.ac-pwr{margin-left:auto;display:inline-flex;align-items:center;gap:.45rem;padding:.45rem 1rem;border-radius:999px;
+  font-size:.9rem;font-weight:800;letter-spacing:.1em;background:#1a1a30;color:var(--dim);border:2px solid #34345a}
+.ac-pwr .ac-pi{font-size:1.05rem;line-height:1}
+.ac-pwr.on{background:var(--up);color:#05210f;border-color:#4ade80;box-shadow:0 0 18px rgba(34,197,94,.55)}
+.card.cold{border-color:rgba(34,197,94,.45)}
 .card.acoff .ac-t{color:var(--dim);font-size:2.3rem;letter-spacing:.06em}
 .card.acoff .ac-scenes,.card.acoff .ac-auto,.card.acoff .ac-temp .ac-tbtn{opacity:.5}
 .ac-note{font-size:.68rem;color:var(--dim);margin-top:.6rem;text-align:center}
@@ -239,11 +240,7 @@ button:active{opacity:.72;transform:scale(.96)}
 <div class="card" id="accard">
   <div class="ch">
     <h2>Air Conditioner</h2>
-    <span class="ac-st" id="acst">--</span>
-    <label class="sw">
-      <input type="checkbox" id="acpwr" onchange="if(!_upd)post('/action/ac/'+(this.checked?'on':'off')).then(refresh)">
-      <span class="sw-t"></span><span class="sw-k"></span>
-    </label>
+    <button class="ac-pwr" id="acpwr" onclick="acPost('/action/ac/toggle')"><span class="ac-pi">&#x23FB;</span><span id="acst">--</span></button>
   </div>
   <div class="ac-temp">
     <button class="ac-tbtn" onclick="acPost('/action/ac/temp?delta=-1')">&minus;</button>
@@ -448,6 +445,7 @@ var ACL={mode:{cool:'Cool',dry:'Dry (dehumidify)',fan:'Fan only',auto:'Auto',hea
   fan:{auto:'Auto',lowest:'Quiet',low:'Low',medium:'Medium',high:'High',max:'Max'},
   sv:{swing:'Sweep',highest:'Up',middle:'Middle',lowest:'Down',off:'Fixed'},sh:{auto:'Sweep',off:'Fixed'}};
 var ACQ={mode:'set?mode=',fan:'set?fan=',sv:'swing_v?pos=',sh:'swing_h?pos='};
+var acOn=false;
 function acPost(u){post(u).then(refresh);}
 function acLive(){
   fetch('/ac/cloud').then(function(r){return r.json()}).then(function(a){
@@ -477,9 +475,9 @@ function acPills(){
 }
 function acUpd(a){
   if(!a)return;
-  setChk('acpwr',a.on);
+  acOn=a.on;
   document.getElementById('accard').className='card'+(a.on?' cold':' acoff');
-  var st=document.getElementById('acst');st.textContent=a.on?'ON':'OFF';st.className='ac-st'+(a.on?' on':'');
+  document.getElementById('acst').textContent=a.on?'ON':'OFF';document.getElementById('acpwr').className='ac-pwr'+(a.on?' on':'');
   document.getElementById('act').textContent=a.on?a.temp+'\u00B0':'OFF';
   document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode):'set to '+a.temp+'\u00B0';
   var cur={mode:a.mode,fan:a.fan,sv:a.swing_v,sh:a.swing_h};
@@ -996,6 +994,14 @@ fn handle(
         }
         ("POST", "/action/ac/on")     => { crate::ac::set_power(true);  ac_event(&peer, "on"); ok(&mut s, network_lock); }
         ("POST", "/action/ac/off")    => { crate::ac::set_power(false); ac_event(&peer, "off"); ok(&mut s, network_lock); }
+        // 2026-10-27: the dashboard's power button used to decide on/off itself from a client-side
+        // `acOn` var that only refreshes every 3s (see acUpd()) -- a click shortly after the AC's
+        // state changed elsewhere (physical button, IR remote, another browser tab) could read
+        // stale `acOn` and send the wrong direction, or race a second rapid click into reading the
+        // same pre-update value twice. Fin-ESP's own ac::button_toggle() (same one the physical
+        // button and IR remote "7" use) is the single authoritative toggle -- it decides off<->on
+        // from Fin-ESP's own just-updated POWER flag, never a client-cached or WiFi-readback value.
+        ("POST", "/action/ac/toggle") => { let on = crate::ac::button_toggle(); ac_event(&peer, if on { "on" } else { "off" }); ok(&mut s, network_lock); }
         ("POST", "/action/ac/listen") => {
             crate::ac::listen(get_param(query, "secs").unwrap_or(120).max(1) as u32);
             ok(&mut s, network_lock);
