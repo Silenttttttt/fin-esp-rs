@@ -777,6 +777,10 @@ fn handle(
             let body = std::format!("count={count}\nkey={key}\n");
             write_response(&mut s, "200 OK", "text/plain", body.as_bytes(), network_lock);
         }
+        ("GET", "/ir/debug") => {
+            let body = crate::ir_remote::debug_status();
+            write_response(&mut s, "200 OK", "text/plain", body.as_bytes(), network_lock);
+        }
         // Same-origin relay for the Climate chart -- see config::URL_EVENT_DASHBOARD_HISTORY's
         // own comment for why this can't just be a direct cross-origin fetch from the browser.
         // Reads a CACHE only (see dht22::spawn_chart_cache_refresher) -- never makes the actual
@@ -1022,6 +1026,7 @@ fn handle(
             }
         }
         ("POST", "/action/ac/resend") => { crate::ac::resend(); ok(&mut s, network_lock); }
+        ("POST", "/action/ir/selftest") => { crate::ac::ir_selftest(); ok(&mut s, network_lock); }
         ("POST", "/action/ac/temp")   => {
             crate::ac::step_temp(get_param(query, "delta").unwrap_or(0).clamp(-14, 14));
             ok(&mut s, network_lock);

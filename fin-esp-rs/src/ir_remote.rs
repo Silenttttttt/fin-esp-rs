@@ -59,6 +59,37 @@ pub fn decode_status() -> (u32, u16) {
     (RAW_DECODE_COUNT.load(Ordering::Relaxed), LAST_DECODED_KEY.load(Ordering::Relaxed))
 }
 
+// ── Diagnostic instrumentation (2026-10-27): added to find a real IR-silence bug without a USB
+// cable -- read-only counters, no behavior change. Exposed on GET /ir/debug.
+static THREAD_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOOP_ITERATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static BLANKED_ITERATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PIN_LOW_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static TIMEOUT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CHECKSUM_FAIL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Which wait_while() call last timed out inside read_nec_frame: 0=header mark, 1=header space,
+/// 2..=33=bit N's mark, 34..=65=bit N's space (N=0..32). 255=none yet.
+static LAST_TIMEOUT_STAGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+/// The actual elapsed microsecond value measured on the call that timed out (for comparing
+/// against the timeout threshold -- e.g. was it way over, or juuust over?). Frame timings never
+/// exceed a few thousand us, so i32 is plenty -- this target has no 64-bit atomics.
+static LAST_TIMEOUT_ELAPSED_US: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn debug_status() -> String {
+    use std::sync::atomic::Ordering;
+    std::format!(
+        "thread_alive={}\nloop_iterations={}\nblanked_iterations={}\npin_low_seen={}\ntimeouts={}\nchecksum_fails={}\nlast_timeout_stage={}\nlast_timeout_elapsed_us={}\n",
+        THREAD_ALIVE.load(Ordering::Relaxed),
+        LOOP_ITERATIONS.load(Ordering::Relaxed),
+        BLANKED_ITERATIONS.load(Ordering::Relaxed),
+        PIN_LOW_SEEN.load(Ordering::Relaxed),
+        TIMEOUT_COUNT.load(Ordering::Relaxed),
+        CHECKSUM_FAIL_COUNT.load(Ordering::Relaxed),
+        LAST_TIMEOUT_STAGE.load(Ordering::Relaxed),
+        LAST_TIMEOUT_ELAPSED_US.load(Ordering::Relaxed),
+    )
+}
+
 fn now_us() -> i64 {
     unsafe { esp_idf_sys::esp_timer_get_time() }
 }
@@ -66,12 +97,22 @@ fn now_us() -> i64 {
 /// Busy-waits while the pin reads `high`, returning elapsed microseconds once it flips, or
 /// `Timeout` if it never does within `timeout_us`. Same shape as dht22.rs's own helper.
 fn wait_while(pin: &PinDriver<'_, Input>, high: bool, timeout_us: i64) -> Result<i64, IrError> {
+    wait_while_staged(pin, high, timeout_us, 255)
+}
+
+fn wait_while_staged(pin: &PinDriver<'_, Input>, high: bool, timeout_us: i64, stage: u8) -> Result<i64, IrError> {
     let start = now_us();
     loop {
         if pin.is_high() != high {
             return Ok(now_us() - start);
         }
-        if now_us() - start > timeout_us {
+        let elapsed = now_us() - start;
+        if elapsed > timeout_us {
+            if stage != 255 {
+                use std::sync::atomic::Ordering;
+                LAST_TIMEOUT_STAGE.store(stage, Ordering::Relaxed);
+                LAST_TIMEOUT_ELAPSED_US.store(elapsed as i32, Ordering::Relaxed);
+            }
             return Err(IrError::Timeout);
         }
     }
@@ -83,13 +124,13 @@ fn wait_while(pin: &PinDriver<'_, Input>, high: bool, timeout_us: i64) -> Result
 /// a 0, ~1687us for a 1. Address and command each arrive LSB-first with their own bitwise
 /// complement immediately after, for a cheap correctness check.
 fn read_nec_frame(pin: &PinDriver<'_, Input>) -> Result<(u8, u8), IrError> {
-    wait_while(pin, false, 11_000)?; // end of header mark
-    wait_while(pin, true, 6_000)?; // end of header space
+    wait_while_staged(pin, false, 11_000, 0)?; // end of header mark
+    wait_while_staged(pin, true, 6_000, 1)?; // end of header space
 
     let mut bytes = [0u8; 4];
     for i in 0..32 {
-        wait_while(pin, false, 700)?; // consume the fixed-length bit mark
-        let space_us = wait_while(pin, true, 2_200)?; // bit-encoding space
+        wait_while_staged(pin, false, 700, 2 + i as u8)?; // consume the fixed-length bit mark
+        let space_us = wait_while_staged(pin, true, 2_200, 34 + i as u8)?; // bit-encoding space
         let bit = if space_us > 1_000 { 1u8 } else { 0u8 };
         bytes[i / 8] = (bytes[i / 8] >> 1) | (bit << 7);
     }
@@ -254,13 +295,17 @@ pub fn spawn_ir_remote_reader(
                 }
             };
             info!("[ir] remote receiver ready on GPIO4");
+            THREAD_ALIVE.store(true, std::sync::atomic::Ordering::Relaxed);
             loop {
+                LOOP_ITERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Our own LG AC frames (IR LED cm away, see ac.rs) aren't remote presses.
                 if crate::ac::tx_blanking() {
+                    BLANKED_ITERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
                 if driver.is_low() {
+                    PIN_LOW_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     match read_nec_frame(&driver) {
                         Ok((address, command)) => {
                             // Same 80ms red-flash acknowledgment the physical buttons
@@ -294,9 +339,11 @@ pub fn spawn_ir_remote_reader(
                             }
                         }
                         Err(IrError::ChecksumMismatch) => {
+                            CHECKSUM_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!("[ir] checksum mismatch, dropping frame");
                         }
                         Err(IrError::Timeout) => {
+                            TIMEOUT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Malformed/partial frame (e.g. a repeat code's shorter
                             // timing) -- not a real button press, ignore.
                         }

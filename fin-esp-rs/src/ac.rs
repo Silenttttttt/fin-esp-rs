@@ -314,6 +314,39 @@ pub fn state_json() -> String {
 // transmit) so what actually left the LED can be compared bit-for-bit with the remote's frames.
 
 const RAW_MAX: usize = 160;
+
+// ── IR self-test (2026-10-27): verify the NEC remote receiver's decode path end-to-end with no
+// human needed. The AC's IR LED (GPIO2) sits cm from the remote receiver's photodiode (GPIO32) --
+// that's the whole reason tx_blanking() exists, to make the receiver IGNORE our own transmissions.
+// This deliberately bypasses blank_for() (unlike every other send path above) so the receiver
+// thread is genuinely listening, letting us confirm the decode pipeline works without a real
+// remote: fires a synthetic NEC frame (address 0x00, command 0xFF -- decoded and counted, but not
+// mapped to any action in ir_remote.rs::dispatch, so this has zero side effects), and a real
+// decode will bump ir_remote::decode_status()'s count and flash the same red LED a real button
+// press would. Safe to remove once no longer needed for diagnosis.
+const NEC_TEST_FRAME_US: [u32; 67] = [
+    9000, 4500, // header
+    // address 0x00 (8 bits, each mark+short-space = "0")
+    562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562,
+    // ~address 0xFF (8 bits, each mark+long-space = "1")
+    562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687,
+    // command 0xFF (8 bits = "1")
+    562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687, 562, 1687,
+    // ~command 0x00 (8 bits = "0")
+    562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562, 562,
+    // trailing stop mark: real NEC frames send one final ~562us mark after the last data bit so the
+    // receiver can measure that bit's own space before the signal ends. Omitting it (the original bug
+    // in this self-test) left the pin HIGH with nothing to end the final wait_while(pin, true, ..) on,
+    // so every run timed out on exactly the last bit's space (confirmed live: last_timeout_stage=65,
+    // elapsed=2202us, ~2us over the 2200us budget) -- a self-test artifact, not a receiver bug.
+    562,
+];
+static PENDING_IR_SELFTEST: AtomicBool = AtomicBool::new(false);
+
+/// Fires the synthetic NEC frame above. See its own comment for why/how. Diagnostic only.
+pub fn ir_selftest() {
+    PENDING_IR_SELFTEST.store(true, Ordering::Relaxed);
+}
 static RAW: std::sync::Mutex<([u32; RAW_MAX], usize)> = std::sync::Mutex::new(([0; RAW_MAX], 0));
 static PENDING_RAW: AtomicBool = AtomicBool::new(false);
 
@@ -348,24 +381,28 @@ unsafe extern "C" fn loop_isr(_: *mut core::ffi::c_void) {
     }
 }
 
-fn loop_init() {
-    unsafe {
-        let _ = esp_idf_sys::gpio_install_isr_service(0); // may already be installed: fine
-        esp_idf_sys::gpio_set_intr_type(LOOP_PIN, esp_idf_sys::gpio_int_type_t_GPIO_INTR_ANYEDGE);
-        esp_idf_sys::gpio_isr_handler_add(LOOP_PIN, Some(loop_isr), core::ptr::null_mut());
-        esp_idf_sys::gpio_intr_disable(LOOP_PIN);
-    }
-}
+// DISABLED (2026-10-27, real bug found live): this raw esp_idf_sys GPIO interrupt claim on
+// GPIO32 -- even with the interrupt immediately disabled right after installing it -- was
+// permanently breaking ir_remote.rs's own PinDriver::input() level-reads on that SAME physical
+// pin (the lamp remote receiver, GPIO32 is shared hardware: see WIRING.md). Confirmed live via
+// a synthetic NEC self-test frame (ac::ir_selftest): loopback (this ISR mechanism) saw it fine,
+// but ir_remote's own `driver.is_low()` never once returned true across 3.9M+ loop iterations
+// while the thread was provably alive and unstarved -- i.e. remote decode was fully dead from
+// the moment this ran at boot, every boot, whether or not a loopback capture was ever actually
+// used. This loopback/sniff diagnostic is also now largely redundant: ac_cloud gives real WiFi
+// telemetry straight from the AC's own sensors, which is strictly better than self-looping our
+// own transmitted IR back through the receiver. Left as safe no-ops (never touch the GPIO/ISR
+// registers) rather than deleted outright, so /ac/loopback and sniff mode degrade gracefully
+// (report nothing) instead of needing every call site below reworked.
+fn loop_init() {}
 
 fn loop_arm() {
     LOOP_N.store(0, Ordering::Relaxed);
     LOOP_ARMED.store(true, Ordering::Relaxed);
-    unsafe { esp_idf_sys::gpio_intr_enable(LOOP_PIN); }
 }
 
 /// Stop capturing and keep the result as "<label> <count> d1 d2 ..." for GET /ac/loopback.
 fn loop_finish(label: &str) {
-    unsafe { esp_idf_sys::gpio_intr_disable(LOOP_PIN); }
     LOOP_ARMED.store(false, Ordering::Relaxed);
     let n = LOOP_N.load(Ordering::Relaxed) as usize;
     let mut out = std::format!("{label} {}", n.saturating_sub(1));
@@ -534,6 +571,19 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 std::thread::sleep(Duration::from_millis(30));
                 sniff_poll();
                 sleep_poll(&persist);
+                if PENDING_IR_SELFTEST.swap(false, Ordering::Relaxed) {
+                    // Deliberately NO blank_for() AND no loop_arm/loop_finish here: the loopback
+                    // ISR shares GPIO32 with ir_remote.rs's own polling PinDriver, and enabling it
+                    // (as an earlier version of this test did) is a confound a real remote press
+                    // never has -- that run's physical signal was independently confirmed clean
+                    // (see /ac/loopback capture, 2026-10-27), so this run tests ONLY the decoder,
+                    // under the exact conditions a real button press would see.
+                    let signal = build_raw_signal(ticks_hz, &NEC_TEST_FRAME_US);
+                    match tx.start_blocking(&signal) {
+                        Ok(()) => info!("[ac] IR self-test frame sent (no blanking, no loopback ISR) -- check /ir/status"),
+                        Err(e) => warn!("[ac] IR self-test send failed: {e:?}"),
+                    }
+                }
                 if PENDING_RAW.swap(false, Ordering::Relaxed) {
                     let (buf, n) = RAW.lock().map(|r| *r).unwrap_or(([0; RAW_MAX], 0));
                     let signal = build_raw_signal(ticks_hz, &buf[..n]);

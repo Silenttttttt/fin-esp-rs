@@ -155,9 +155,23 @@ pub fn spawn(network_lock: Arc<Mutex<()>>, persist: Persist) {
         .stack_size(LAUNCHER_STACK)
         .spawn(move || {
             std::thread::sleep(START_DELAY);
+            // Pinned to Core0, same reasoning as ir_remote.rs's receiver pinning to Core1 (see
+            // that function's own comment) -- this worker does TLS handshakes (~1.1s of real
+            // crypto work) plus ongoing MQTT/clip processing, long and bursty enough that, left
+            // unpinned, the scheduler can land it on Core1 and starve ir_remote's own Core1
+            // decode loop (a tight, non-yielding busy-wait through an entire NEC frame) mid-read
+            // -- exactly the class of bug dht22.rs and ir_remote.rs were already fixed for.
+            // Core0 is also where WiFi/LWIP naturally runs on this chip, so this is the native
+            // fit for networking work, not a forced compromise. Reset to default right after
+            // spawning so no later, unrelated thread-spawn in this process inherits this pin.
+            use esp_idf_hal::cpu::Core;
+            use esp_idf_hal::task::thread::ThreadSpawnConfiguration;
             for attempt in 0..6 {
                 let lock = Arc::clone(&network_lock);
-                match std::thread::Builder::new().name("acCloud".into()).stack_size(STACK).spawn(move || run(lock)) {
+                let _ = ThreadSpawnConfiguration { pin_to_core: Some(Core::Core0), ..Default::default() }.set();
+                let spawned = std::thread::Builder::new().name("acCloud".into()).stack_size(STACK).spawn(move || run(lock));
+                let _ = ThreadSpawnConfiguration::default().set();
+                match spawned {
                     Ok(_) => return, // launcher exits, its 4 KB stack is freed
                     Err(e) => {
                         warn!("[ac_cloud] worker spawn failed ({e}), attempt {attempt}, retrying in 10s");
