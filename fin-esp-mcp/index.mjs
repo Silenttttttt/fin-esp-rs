@@ -170,7 +170,7 @@ async function acCommand(path, params) {
   const real = st.real ? `${st.real.on ? `${st.real.temp}C ${st.real.mode}` : "off"}` : "unknown";
   let result;
   if (st.pending) result = `STILL SENDING after ${AC_VERIFY_TIMEOUT_MS / 1000}s (try ${st.tries}); AC reports ${real}. Not confirmed.`;
-  else if (st.verify === "confirmed") result = `CONFIRMED by the AC itself (${st.tries} send(s)); AC reports ${real}.`;
+  else if (st.verify === "confirmed") result = `CONFIRMED by the AC itself (via ${st.path === "wifi" ? "WiFi" : "IR"}, ${st.tries} send(s)); AC reports ${real}.`;
   else if (st.verify === "failed") result = `FAILED: the AC did not take it after ${st.tries} sends; it still reports ${real}. Fin-ESP now shows the AC's real state. Tell the user it did not work.`;
   else if (st.verify === "unverified") result = `SENT ONCE but NOT CONFIRMED: no readback from the AC right now (ac_cloud not connected).`;
   else result = `no main frame was needed/sent (verify=${st.verify}); AC reports ${real}.`;

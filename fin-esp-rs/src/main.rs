@@ -1080,8 +1080,8 @@ fn main() {
         last_btn_chart = chart_btn;
 
         // ── Blue button (GPIO 27, active LOW): LG AC on/off ───────────────────
-        // Repurposed 2026-10-26 (Muni): was media play/pause; now toggles the AC (on = cool
-        // 21C, see ac::button_toggle). Web/IR-remote play/pause (web_triggers.media,
+        // Repurposed 2026-10-26 (Muni): was media play/pause; now a pure AC power toggle based on
+        // the AC's real power (see ac::button_toggle). Web/IR-remote play/pause (web_triggers.media,
         // PLAY_PAUSE_READY) are unchanged -- only the physical button moved to the AC.
         let media_raw = btn_media.is_high();
         if media_raw != media_raw_last {

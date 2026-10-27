@@ -3,8 +3,10 @@
 //!   cloud/thinq2/provisioning.ts generateDeployResponse
 //!   cloud/devices/tlv_device.ts  caps query -> values query -> periodic values query
 //!
-//! READ-ONLY toward the AC except for the exact same caps/values *queries* rethink already sends it
-//! every 28 s / 15 min today (0x1f5 = 1 / 2). No setting is ever written from here.
+//! Toward the AC: the caps/values *queries* rethink sends (0x1f5 = 1 / 2), plus (2026-10-27, Muni's
+//! request: WiFi is the primary control path, IR the fallback) the exact climate writes rethink's
+//! RAC_056905_WW driver sends -- power 0x1f7, mode 0x1f9, fan 0x1fa, target 0x1fe, header
+//! [1,1,2,1,1] -- built only by `write_climate` from validated values. Nothing else is ever written.
 
 use super::tlv;
 use serde::Deserialize;
@@ -96,6 +98,18 @@ fn json_safe(s: &str) -> bool {
 
 impl Clip {
     pub fn did(&self) -> Option<&str> { self.did.as_deref() }
+
+    /// Publish one climate write (rethink TLVDevice.setProperty -> send([1,1,2,1,1], tlv)). Only
+    /// once the AC has answered the values query (same gate rethink's HA bridge has). Returns
+    /// whether it was published.
+    pub fn write(&mut self, elems: &[(u16, u32)], out: &mut Out) -> bool {
+        if !self.values { return false; }
+        let Some(did) = self.did.as_deref() else { return false };
+        let frame = tlv::build_frame([1, 1, 2, 1, 1], elems);
+        log::info!("[ac_cloud] climate write {:?} -> {}", elems, tlv::hex_upper(&frame));
+        out.push((format!("{LIME}{did}"), packet_msg(did, &frame)));
+        true
+    }
 
     /// rethink DeviceAcceptor.mqtt(): one PUBLISH from the AC.
     pub fn on_publish(&mut self, topic: &str, payload: &[u8], now: u64, out: &mut Out) {

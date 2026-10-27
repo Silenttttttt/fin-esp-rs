@@ -14,8 +14,9 @@
 //!   only drops that connection; bind failures retry with backoff;
 //! - every TLS handshake is heap-gated (free + largest block) and serialized with the lamp/web
 //!   network work via `network_lock`; at most one MQTT session + one short-lived HTTPS request.
-//! - read-only toward the AC: the only thing ever sent to it is what rethink already sends
-//!   (completeProvisioning, resp_timesync, caps/values *queries*). No settings are written.
+//! - toward the AC: what rethink sends (completeProvisioning, resp_timesync, caps/values queries)
+//!   plus climate writes of power/mode/fan/target only (`write_climate`, rethink RAC_056905_WW's
+//!   exact frames), requested by ac.rs. No other register is ever written.
 
 pub mod clip;
 pub mod mqtt;
@@ -26,7 +27,7 @@ use crate::persist::Persist;
 use log::{info, warn};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tls::{heap_free, heap_largest, TlsConn};
@@ -599,8 +600,45 @@ impl Session {
         with_shared(|sh| power_on = sh.regs.get(0x1f7) == Some(1));
         let mut out: clip::Out = Vec::new();
         self.clip.tick(now, power_on, &mut out);
+        let write = WRITE_REQ.lock().ok().and_then(|mut w| w.take());
+        if let Some((elems, n)) = write {
+            if self.clip.write(&elems[..n], &mut out) {
+                WRITES_SENT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                WRITES_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.deliver(&out)
     }
+}
+
+// ── Climate writes requested by ac.rs (WiFi control path) ─────────────────────────────────────
+
+/// One pending write, consumed by the session thread on its next tick (<= ~0.5 s).
+static WRITE_REQ: Mutex<Option<([(u16, u32); 4], usize)>> = Mutex::new(None);
+static WRITES_SENT: AtomicU32 = AtomicU32::new(0);
+static WRITES_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+pub fn writes_sent() -> u32 { WRITES_SENT.load(Ordering::Relaxed) }
+
+/// Ask the live session to write power/mode/fan/target. Only these four registers, with values
+/// range-checked here (power 0/1, mode in rethink's MODES, fan in FAN_MODES, target 16-30 C in
+/// half degrees). Returns false (caller falls back to IR) if there is no live readback/session.
+pub fn write_climate(elems: &[(u16, u32)]) -> bool {
+    if elems.is_empty() || elems.len() > 4 || readback().is_none() { return false; }
+    for &(t, v) in elems {
+        let ok = match t {
+            0x1f7 => v <= 1,
+            0x1f9 => matches!(v, 0 | 1 | 2 | 4 | 6),
+            0x1fa => matches!(v, 2..=6 | 8),
+            0x1fe => (32..=60).contains(&v),
+            _ => false,
+        };
+        if !ok { warn!("[ac_cloud] refused climate write {t:#x}={v}"); return false; }
+    }
+    let mut buf = [(0u16, 0u32); 4];
+    buf[..elems.len()].copy_from_slice(elems);
+    match WRITE_REQ.lock() { Ok(mut w) => { *w = Some((buf, elems.len())); true } Err(_) => false }
 }
 
 // ── Readback for ac.rs (closed-loop IR) ─────────────────────────────────────────────────────────

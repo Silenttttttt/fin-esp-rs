@@ -49,7 +49,7 @@ pub const SWING_H: [(&str, u32); 2] = [("off", 0x881317C), ("auto", 0x881316B)];
 
 pub const TEMP_MIN: u8 = 16;
 pub const TEMP_MAX: u8 = 30;
-/// Blue button turns the AC on at this temperature (Muni's spec, 2026-10-26).
+/// Default setpoint before any state exists, and the "comfort" preset's temperature.
 pub const BUTTON_ON_TEMP: u8 = 21;
 
 const LG_OFF: u32 = 0x88C0051;
@@ -59,11 +59,51 @@ const LG_OFF: u32 = 0x88C0051;
 // header 3245/9871, mark 518, 0=510, 1=1563 vs the remote's 3097/9420, 495, 504, 1504 through
 // the same receiver -- 4-5% off, which a weak LED leaves no margin for. Each value below is the
 // old one shifted by (remote - ours) as measured.
-const HDR_MARK: u64 = 3050;
-const HDR_SPACE: u64 = 9450;
-const BIT_MARK: u64 = 460;
-const ZERO_SPACE: u64 = 540;
-const ONE_SPACE: u64 = 1540;
+// Runtime-tunable (GET /ac/txcfg, POST /action/ac/txcfg) so delivery can be measured against the
+// AC's own readback without a reflash per variant. RAM only: a reboot restores these defaults.
+static HDR_MARK: AtomicU32 = AtomicU32::new(3050);
+static HDR_SPACE: AtomicU32 = AtomicU32::new(9450);
+static BIT_MARK: AtomicU32 = AtomicU32::new(460);
+static ZERO_SPACE: AtomicU32 = AtomicU32::new(540);
+static ONE_SPACE: AtomicU32 = AtomicU32::new(1540);
+/// Copies of each frame per transmission. Safe because every code Fin-ESP sends is absolute
+/// (never a toggle): an AC that receives two copies just applies the same setting twice.
+static COPIES: AtomicU8 = AtomicU8::new(1);
+/// Silence between copies (LG2 minimum message gap is ~40 ms, IRremoteESP8266 kLgMinGap).
+static COPY_GAP_MS: AtomicU32 = AtomicU32::new(60);
+/// Carrier duty %. Applied by the sender thread via rmt_set_tx_carrier when it changes.
+static DUTY_PCT: AtomicU8 = AtomicU8::new(50);
+static DUTY_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// "k=v&k=v" over the knobs above; unknown keys/out-of-range values are rejected (false).
+pub fn set_txcfg(query: &str) -> bool {
+    for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+        let Some((k, v)) = kv.split_once('=') else { return false };
+        let Ok(n) = v.parse::<u32>() else { return false };
+        let ok = match k {
+            "hdr_mark" if (2000..=5000).contains(&n) => { HDR_MARK.store(n, Ordering::Relaxed); true }
+            "hdr_space" if (6000..=12000).contains(&n) => { HDR_SPACE.store(n, Ordering::Relaxed); true }
+            "bit_mark" if (300..=800).contains(&n) => { BIT_MARK.store(n, Ordering::Relaxed); true }
+            "zero_space" if (300..=900).contains(&n) => { ZERO_SPACE.store(n, Ordering::Relaxed); true }
+            "one_space" if (1100..=2000).contains(&n) => { ONE_SPACE.store(n, Ordering::Relaxed); true }
+            "copies" if (1..=4).contains(&n) => { COPIES.store(n as u8, Ordering::Relaxed); true }
+            "gap_ms" if (20..=500).contains(&n) => { COPY_GAP_MS.store(n, Ordering::Relaxed); true }
+            "duty" if (10..=90).contains(&n) => { DUTY_PCT.store(n as u8, Ordering::Relaxed); DUTY_DIRTY.store(true, Ordering::Relaxed); true }
+            _ => false,
+        };
+        if !ok { return false; }
+    }
+    true
+}
+
+pub fn txcfg_json() -> String {
+    std::format!(
+        r#"{{"hdr_mark":{},"hdr_space":{},"bit_mark":{},"zero_space":{},"one_space":{},"copies":{},"gap_ms":{},"duty":{},"verify_wait_ms":{}}}"#,
+        HDR_MARK.load(Ordering::Relaxed), HDR_SPACE.load(Ordering::Relaxed), BIT_MARK.load(Ordering::Relaxed),
+        ZERO_SPACE.load(Ordering::Relaxed), ONE_SPACE.load(Ordering::Relaxed), COPIES.load(Ordering::Relaxed),
+        COPY_GAP_MS.load(Ordering::Relaxed), DUTY_PCT.load(Ordering::Relaxed), VERIFY_WAIT_MS,
+    )
+}
 
 /// More GPIOs driving the SAME LED (jumpered onto the one KY-005's S pin). KY-005 has no
 /// series resistor and no transistor (middle pin unconnected), so the LED's current is capped
@@ -162,9 +202,9 @@ fn mark_main() {
 
 // ── Closed loop: verify every main frame against the AC's own readback ──────────────────────
 
-/// How long to wait for the AC to report a frame's settings before re-sending it. The AC reports
-/// a change within ~1-3 s when it took the frame (measured 2026-10-27).
-const VERIFY_WAIT_MS: u32 = 6_000;
+/// How long to wait for the AC to report a frame's settings before re-sending it. Measured
+/// 2026-10-27: when the AC takes a frame its WiFi report arrives ~1 s later.
+const VERIFY_WAIT_MS: u32 = 3_000;
 /// Total transmissions of one main frame before giving up and reporting failure.
 const VERIFY_MAX_SENDS: u8 = 4;
 /// Adopt the AC's reported state only after this long without any local change.
@@ -184,6 +224,36 @@ static RETRY_MAIN: AtomicBool = AtomicBool::new(false);
 static FAILED_WANT: AtomicU32 = AtomicU32::new(0);
 /// How many times Fin-ESP's state was corrected from the AC's own report.
 static ADOPTED: AtomicU32 = AtomicU32::new(0);
+
+const PATH_NONE: u8 = 0;
+const PATH_WIFI: u8 = 1;
+const PATH_IR: u8 = 2;
+/// Which path carried the last main-state send.
+static PATH: AtomicU8 = AtomicU8::new(PATH_NONE);
+
+/// Send the requested power/mode/fan/target over the AC's WiFi link, exactly as rethink's
+/// RAC_056905_WW driver does: off = [0x1f7=0]; on from off = [0x1f7=1, mode, fan, target];
+/// change while on = [target, mode, fan]. False = no live link, caller uses IR.
+fn wifi_write() -> bool {
+    let Some(rb) = crate::ac_cloud::readback() else { return false };
+    if !POWER.load(Ordering::Relaxed) {
+        return crate::ac_cloud::write_climate(&[(0x1f7, 0)]);
+    }
+    let mode = mode_tlv(MODE.load(Ordering::Relaxed));
+    let fan = FAN_TLV[FAN.load(Ordering::Relaxed) as usize % FAN_TLV.len()];
+    let target = TEMP.load(Ordering::Relaxed) as u32 * 2;
+    if rb.power {
+        crate::ac_cloud::write_climate(&[(0x1fe, target), (0x1f9, mode), (0x1fa, fan)])
+    } else {
+        crate::ac_cloud::write_climate(&[(0x1f7, 1), (0x1f9, mode), (0x1fa, fan), (0x1fe, target)])
+    }
+}
+
+fn state_json_short() -> String {
+    std::format!("on={} mode={} temp={} fan={}", POWER.load(Ordering::Relaxed),
+        MODES[MODE.load(Ordering::Relaxed) as usize % MODES.len()], TEMP.load(Ordering::Relaxed),
+        FANS[FAN.load(Ordering::Relaxed) as usize % FANS.len()].0)
+}
 
 /// IR mode index (MODES) -> AC's TLV mode code (rethink RAC_056905_WW MODES).
 fn mode_tlv(idx: u8) -> u32 {
@@ -249,8 +319,8 @@ fn closed_loop(persist: &Persist) {
         if waited < VERIFY_WAIT_MS { return; }
         let sends = VERIFY_SENDS.load(Ordering::Relaxed);
         if sends < VERIFY_MAX_SENDS {
-            warn!("[ac] AC still reports power={} mode={} target={:?} after send {sends}: re-sending",
-                rb.power, rb.mode, rb.target_half);
+            warn!("[ac] AC still reports power={} mode={} target={:?} after {} send {sends}: re-sending over IR",
+                rb.power, rb.mode, rb.target_half, if PATH.load(Ordering::Relaxed) == PATH_WIFI { "WiFi" } else { "IR" });
             RETRY_MAIN.store(true, Ordering::Relaxed);
             // Back-date so the sender doesn't wait SETTLE_MS for a retry.
             LAST_CHANGE_MS.store(now.wrapping_sub(SETTLE_MS as u32), Ordering::Relaxed);
@@ -315,12 +385,19 @@ fn sleep_poll(persist: &Persist) {
 }
 
 /// Blue button: off -> on in cool at BUTTON_ON_TEMP; on -> off. Returns the new power state.
+///
+/// 2026-10-27 (Muni: "it should be toggle on and off"): a pure power toggle now. It flips the AC's
+/// REAL power as reported over WiFi (Fin-ESP's own flag could be stale after a missed frame, which
+/// made a press meant as "off" come out as "on at 21C"), unless a change is still in flight, in
+/// which case it flips that requested state. Turning on keeps the current mode/temp/fan.
 pub fn button_toggle() -> bool {
-    let on = !POWER.load(Ordering::Relaxed);
-    if on {
-        MODE.store(0, Ordering::Relaxed);
-        TEMP.store(BUTTON_ON_TEMP, Ordering::Relaxed);
-    }
+    let in_flight = PENDING_MAIN.load(Ordering::Relaxed) || VERIFY.load(Ordering::Relaxed) == V_WAITING;
+    let current = if in_flight {
+        POWER.load(Ordering::Relaxed)
+    } else {
+        crate::ac_cloud::readback().map(|r| r.power).unwrap_or(POWER.load(Ordering::Relaxed))
+    };
+    let on = !current;
     set_power(on);
     on
 }
@@ -431,7 +508,7 @@ pub fn state_json() -> String {
         _ => "null".into(),
     };
     std::format!(
-        r#"{{"on":{},"mode":"{}","temp":{},"fan":"{}","swing_v":"{}","swing_h":"{}","jet":{},"off_in_min":{},"auto_clean":{},"energy_saving":{},"power_limit":{},"sent":{},"pending":{},"verify":"{}","tries":{},"in_sync":{},"real":{},"failed_want":{},"corrected":{}}}"#,
+        r#"{{"on":{},"mode":"{}","temp":{},"fan":"{}","swing_v":"{}","swing_h":"{}","jet":{},"off_in_min":{},"auto_clean":{},"energy_saving":{},"power_limit":{},"sent":{},"pending":{},"verify":"{}","tries":{},"in_sync":{},"real":{},"failed_want":{},"corrected":{},"path":"{}","wifi_writes":{}}}"#,
         POWER.load(Ordering::Relaxed),
         MODES[MODE.load(Ordering::Relaxed) as usize % MODES.len()],
         TEMP.load(Ordering::Relaxed),
@@ -452,6 +529,8 @@ pub fn state_json() -> String {
         real,
         failed_want,
         ADOPTED.load(Ordering::Relaxed),
+        ["none", "wifi", "ir"][PATH.load(Ordering::Relaxed) as usize % 3],
+        crate::ac_cloud::writes_sent(),
     )
 }
 
@@ -655,12 +734,14 @@ fn build_signal(ticks_hz: esp_idf_hal::units::Hertz, code: u32) -> VariableLengt
     let mark = |us: u64| Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_micros(us)).unwrap();
     let space = |us: u64| Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_micros(us)).unwrap();
     let mut signal = VariableLengthSignal::with_capacity(2 + 28 * 2 + 1);
-    let _ = signal.push([&mark(HDR_MARK), &space(HDR_SPACE)]);
+    let ld = |a: &AtomicU32| a.load(Ordering::Relaxed) as u64;
+    let (bit_mark, zero, one) = (ld(&BIT_MARK), ld(&ZERO_SPACE), ld(&ONE_SPACE));
+    let _ = signal.push([&mark(ld(&HDR_MARK)), &space(ld(&HDR_SPACE))]);
     for b in (0..28).rev() {
-        let s = if (code >> b) & 1 != 0 { ONE_SPACE } else { ZERO_SPACE };
-        let _ = signal.push([&mark(BIT_MARK), &space(s)]);
+        let s = if (code >> b) & 1 != 0 { one } else { zero };
+        let _ = signal.push([&mark(bit_mark), &space(s)]);
     }
-    let _ = signal.push([&mark(BIT_MARK)]);
+    let _ = signal.push([&mark(bit_mark)]);
     signal
 }
 
@@ -760,14 +841,25 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 }
                 let mut frames: heapless_frames::Frames = Default::default();
                 let mut main_on: Option<bool> = None;
+                let mut via_wifi = false;
                 if PENDING_MAIN.swap(false, Ordering::Relaxed) {
-                    if RETRY_MAIN.swap(false, Ordering::Relaxed) {
+                    let retry = RETRY_MAIN.swap(false, Ordering::Relaxed);
+                    if retry {
                         VERIFY_SENDS.fetch_add(1, Ordering::Relaxed);
                     } else {
                         VERIFY_SENDS.store(1, Ordering::Relaxed);
                     }
-                    frames.push(main_frame());
-                    main_on = Some(POWER.load(Ordering::Relaxed));
+                    // WiFi first (the AC's own cloud link, confirmed by its report ~1 s later);
+                    // IR when there's no live link or a WiFi write wasn't confirmed (retry).
+                    if !retry && wifi_write() {
+                        via_wifi = true;
+                        PATH.store(PATH_WIFI, Ordering::Relaxed);
+                        info!("[ac] main state sent over WiFi: {}", state_json_short());
+                    } else {
+                        frames.push(main_frame());
+                        main_on = Some(POWER.load(Ordering::Relaxed));
+                        PATH.store(PATH_IR, Ordering::Relaxed);
+                    }
                     JET.store(false, Ordering::Relaxed); // any settings frame ends Jet, like the remote
                 }
                 let mut jet_sent = false;
@@ -795,12 +887,26 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 if PENDING_SHOW_POWER.swap(false, Ordering::Relaxed) && on {
                     frames.push(LG_SHOW_POWER);
                 }
+                if DUTY_DIRTY.swap(false, Ordering::Relaxed) {
+                    // Legacy RMT carrier counts are in APB ticks (80 MHz): 38 kHz = 2105 ticks/period.
+                    let period: u32 = 80_000_000 / 38_000;
+                    let high = (period * DUTY_PCT.load(Ordering::Relaxed) as u32 / 100) as u16;
+                    let low = (period as u16).saturating_sub(high);
+                    let r = unsafe { esp_idf_sys::rmt_set_tx_carrier(0, true, high, low, esp_idf_sys::rmt_carrier_level_t_RMT_CARRIER_LEVEL_HIGH) };
+                    info!("[ac] carrier duty {}% ({high}/{low}): {}", DUTY_PCT.load(Ordering::Relaxed), r);
+                }
                 for (i, code) in frames.iter().enumerate() {
                     if i > 0 { std::thread::sleep(Duration::from_millis(400)); } // let the AC finish its beep
                     let signal = build_signal(ticks_hz, code);
                     blank_for(1_000_000);
                     loop_arm();
-                    let res = tx.start_blocking(&signal);
+                    let mut res = tx.start_blocking(&signal);
+                    for _ in 1..COPIES.load(Ordering::Relaxed) {
+                        if res.is_err() { break; }
+                        blank_for(1_000_000);
+                        std::thread::sleep(Duration::from_millis(COPY_GAP_MS.load(Ordering::Relaxed) as u64));
+                        res = tx.start_blocking(&signal);
+                    }
                     blank_for(TX_BLANK_TAIL_US);
                     std::thread::sleep(Duration::from_millis(60));
                     loop_finish(&std::format!("0x{code:07X}"));
@@ -808,6 +914,10 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                         Ok(()) => { SENT.fetch_add(1, Ordering::Relaxed); info!("[ac] sent 0x{code:07X}"); }
                         Err(e) => warn!("[ac] send 0x{code:07X} failed: {e:?}"),
                     }
+                }
+                if via_wifi {
+                    VERIFY_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+                    VERIFY.store(V_WAITING, Ordering::Relaxed);
                 }
                 if let Some(on) = main_on {
                     LAST_SENT_ON.store(on, Ordering::Relaxed);

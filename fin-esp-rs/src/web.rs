@@ -489,7 +489,7 @@ function acUpd(a){
   else if(a.verify==='failed'&&a.failed_want)n='AC did not take '+(a.failed_want.on?a.failed_want.temp+'\u00B0 '+a.failed_want.mode:'off')+' \u2014 showing what the AC really has. ';
   else if(a.in_sync===false&&a.real)n='AC reports '+(a.real.on?a.real.temp+'\u00B0 '+a.real.mode:'off')+' ';
   else if(a.verify==='unverified')n='Sent, but no AC readback to confirm it. ';
-  else if(a.in_sync===true)n='\u2713 matches the AC ';
+  else if(a.in_sync===true)n='\u2713 matches the AC'+(a.verify==='confirmed'&&a.path!=='none'?' (sent via '+(a.path==='wifi'?'WiFi':'IR')+(a.tries>1?', '+a.tries+' tries':'')+')':'')+' ';
   document.getElementById('acnote').textContent=n+
     (m!==null&&a.on?('Turns off in '+(m>=60?Math.floor(m/60)+'h '+(m%60)+'m':m+'m')):'');
   ['60','120','240','480','0'].forEach(function(v){document.getElementById('acsl-'+v).className=(v==='0'&&m===null)?'act':'';});
@@ -1032,6 +1032,18 @@ fn handle(
             }
         }
         ("POST", "/action/ac/resend") => { crate::ac::resend(); ok(&mut s, network_lock); }
+        ("GET", "/ac/txcfg") => {
+            let json = crate::ac::txcfg_json();
+            write_response(&mut s, "200 OK", "application/json", json.as_bytes(), network_lock);
+        }
+        ("POST", "/action/ac/txcfg") => {
+            if crate::ac::set_txcfg(query) {
+                let json = crate::ac::txcfg_json();
+                write_response(&mut s, "200 OK", "application/json", json.as_bytes(), network_lock);
+            } else {
+                write_response(&mut s, "400 Bad Request", "text/plain", b"keys: hdr_mark hdr_space bit_mark zero_space one_space copies gap_ms duty", network_lock);
+            }
+        }
         ("POST", "/action/ir/selftest") => { crate::ac::ir_selftest(); ok(&mut s, network_lock); }
         ("POST", "/action/ac/temp")   => {
             crate::ac::step_temp(get_param(query, "delta").unwrap_or(0).clamp(-14, 14));

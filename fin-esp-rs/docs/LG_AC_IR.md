@@ -128,10 +128,19 @@ off 120 min `0x8890788`.
 2. Every settings frame carries the complete state.
 3. Timers run on Fin-ESP, never on the AC.
 4. State persists in NVS; nothing is transmitted at boot.
-5. One frame per command, no retries: reliability comes from signal quality, not repetition.
+5. Since 2026-10-27 IR is the FALLBACK path. Power/mode/temp/fan go first over the AC's own WiFi
+   link (Fin-ESP is its cloud, `src/ac_cloud/`: rethink RAC_056905_WW's exact 0x1f7/0x1f9/0x1fa/0x1fe
+   writes) and are confirmed by the AC's own report, typically ~1 s (10/10 first-try in testing). If
+   there's no live link or the AC doesn't confirm within 3 s, the full-state IR frame is sent and
+   re-sent (absolute, so idempotent) every 3 s until the AC reports it, max 4 sends in total; then the
+   command is reported FAILED and Fin-ESP adopts the AC's real state. When idle, Fin-ESP always adopts
+   what the AC reports (LG remote, missed frame), so its state never drifts from the AC's.
+   IR alone misses frames often (measured: 1-3 misses before a hit on some commands) -- the LED is
+   GPIO-driven with no transistor. TX timing/copies/duty are runtime-tunable: `GET/POST /ac/txcfg`.
+6. The blue button is a pure power toggle of the AC's REAL (reported) power state.
 
-What remains outside Fin-ESP's control: a frame that physically doesn't arrive (LED power/aim),
-and the AC losing mains power.
+What remains outside Fin-ESP's control: the AC losing mains power, or both the WiFi link and IR
+failing (reported as FAILED / unconfirmed, never as done).
 
 ## Sources
 
