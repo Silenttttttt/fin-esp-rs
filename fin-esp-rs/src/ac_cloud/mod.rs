@@ -603,6 +603,45 @@ impl Session {
     }
 }
 
+// ── Readback for ac.rs (closed-loop IR) ─────────────────────────────────────────────────────────
+
+/// The AC's real main settings as it reports them over this session. `mode`/`fan` are raw TLV
+/// codes (rethink RAC_056905_WW MODES / FAN_MODES), `target_half` is the setpoint in half-degrees C.
+pub struct Readback {
+    pub power: bool,
+    pub mode: u32,
+    pub fan: Option<u32>,
+    pub target_half: Option<u32>,
+}
+
+/// A TLV frame must have arrived this recently for the readback to count as live. The AC pushes
+/// on every change and Fin-ESP re-queries every QUERY_ACTIVE/IDLE interval, so a healthy session
+/// is never close to this.
+const READBACK_MAX_AGE_MS: u64 = 90_000;
+
+/// Some(..) only while the AC is connected, has sent its full value set, and is still talking.
+/// None means "no trustworthy readback" -- callers must then not claim anything was confirmed.
+pub fn readback() -> Option<Readback> {
+    let mut out = None;
+    with_shared(|sh| {
+        let st = &sh.st;
+        if !st.connected || !st.values || st.last_frame_ms == 0 {
+            return;
+        }
+        if now_ms().saturating_sub(st.last_frame_ms) > READBACK_MAX_AGE_MS {
+            return;
+        }
+        let (Some(p), Some(m)) = (sh.regs.get(0x1f7), sh.regs.get(0x1f9)) else { return };
+        out = Some(Readback {
+            power: p == 1,
+            mode: m,
+            fan: sh.regs.get(0x1fa),
+            target_half: sh.regs.get(0x1fe),
+        });
+    });
+    out
+}
+
 // ── Status JSON (GET /ac/cloud) ─────────────────────────────────────────────────────────────────
 
 pub fn status_json() -> String {

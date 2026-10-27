@@ -1088,6 +1088,14 @@ fn main() {
             media_raw_last = media_raw;
             media_raw_since_ms = now;
         }
+        // While (and just after) the AC IR LED transmits -- up to ~120 mA bursts at 38 kHz from
+        // GPIO2/4/25 at max drive -- don't let a press confirm: keep restarting the debounce
+        // window. 2026-10-27: device-events showed bursts of "AC on/off (button)" toggles landing
+        // together with IR sends; a phantom toggle here sends an OFF or a 21C frame on its own.
+        // A real press lasting past the blanking window still registers.
+        if ac::tx_blanking() {
+            media_raw_since_ms = now;
+        }
         let mut phys_media = false;
         if media_raw != media_stable_state && now - media_raw_since_ms >= config::DEBOUNCE_MS {
             if media_stable_state && !media_raw {

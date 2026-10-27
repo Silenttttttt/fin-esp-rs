@@ -151,18 +151,42 @@ server.registerTool(
 );
 
 // ── LG air conditioner (IR, fin-esp-rs/src/ac.rs) ───────────────────────────
-// IR is one-way. Fin-ESP is the AC's ONLY controller: every frame carries the full setting,
-// timers run on Fin-ESP itself and toggle codes are never sent, so its saved state IS the AC's
-// state. A non-error response means Fin-ESP accepted the change and transmits it within ~0.3 s.
+// IR is one-way, but since 2026-10-27 Fin-ESP verifies every main frame against the AC's own WiFi
+// readback (ac_cloud) and re-sends until the AC reports the change (or gives up and reports
+// failure). So power/set/preset/resend WAIT for that verdict and return it -- an accepted POST is
+// NOT a confirmation (the AC silently missed frames while this tool used to report success).
+
+const AC_VERIFY_TIMEOUT_MS = 40000;
+
+async function acCommand(path, params) {
+  await post(path, params);
+  const t0 = Date.now();
+  let st;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try { st = JSON.parse(await get("/ac/state")); } catch { continue; }
+    if (!st.pending || Date.now() - t0 > AC_VERIFY_TIMEOUT_MS) break;
+  }
+  const real = st.real ? `${st.real.on ? `${st.real.temp}C ${st.real.mode}` : "off"}` : "unknown";
+  let result;
+  if (st.pending) result = `STILL SENDING after ${AC_VERIFY_TIMEOUT_MS / 1000}s (try ${st.tries}); AC reports ${real}. Not confirmed.`;
+  else if (st.verify === "confirmed") result = `CONFIRMED by the AC itself (${st.tries} send(s)); AC reports ${real}.`;
+  else if (st.verify === "failed") result = `FAILED: the AC did not take it after ${st.tries} sends; it still reports ${real}. Fin-ESP now shows the AC's real state. Tell the user it did not work.`;
+  else if (st.verify === "unverified") result = `SENT ONCE but NOT CONFIRMED: no readback from the AC right now (ac_cloud not connected).`;
+  else result = `no main frame was needed/sent (verify=${st.verify}); AC reports ${real}.`;
+  return text(`${result}\n${JSON.stringify(st)}`);
+}
 
 server.registerTool(
   "fin_esp_ac_status",
   {
     title: "AC status",
     description:
-      "The air conditioner's state as Fin-ESP holds it (authoritative, Fin-ESP is its only controller): on, mode, " +
-      "temp (C), fan, swing_v (up/down flap), swing_h (left/right), jet, off_in_min (sleep timer, null = none), " +
-      "auto_clean, energy_saving, power_limit (%).",
+      "The air conditioner's state: on, mode, temp (C), fan, swing_v (up/down flap), swing_h (left/right), jet, " +
+      "off_in_min (sleep timer, null = none), auto_clean, energy_saving, power_limit (%). on/mode/temp/fan are kept " +
+      "equal to what the AC itself reports over WiFi (`real`; null = no readback right now). `in_sync` = whether " +
+      "they match the AC right now; `verify` = verdict of the last command (waiting/confirmed/failed/unverified); " +
+      "`failed_want` = what a failed command asked for.",
     inputSchema: {},
     annotations: readOnly,
   },
@@ -176,7 +200,7 @@ server.registerTool(
     description: "Turn the AC on (with its saved mode/temp/fan) or off. Turning it off cancels any sleep timer.",
     inputSchema: { on: z.boolean() },
   },
-  async ({ on }) => text(await post(`/action/ac/${on ? "on" : "off"}`)),
+  async ({ on }) => acCommand(`/action/ac/${on ? "on" : "off"}`),
 );
 
 server.registerTool(
@@ -185,6 +209,7 @@ server.registerTool(
     title: "AC mode/temperature/fan",
     description:
       "Change mode, target temperature and/or fan; omitted fields keep their value. Always turns the AC on. " +
+      "Waits (up to ~40 s) until the AC itself confirms or Fin-ESP gives up, and says which. " +
       "mode: cool, dry (dehumidify), fan (air only), auto (LG 'AI': the AC chooses), heat.",
     inputSchema: {
       mode: z.enum(["cool", "dry", "fan", "auto", "heat"]).optional(),
@@ -197,7 +222,7 @@ server.registerTool(
     if (mode !== undefined) params.mode = mode;
     if (temp !== undefined) params.temp = temp;
     if (fan !== undefined) params.fan = fan;
-    return text(await post("/action/ac/set", params));
+    return acCommand("/action/ac/set", params);
   },
 );
 
@@ -210,7 +235,7 @@ server.registerTool(
       "24C quietest fan; dry = dehumidify 23C.",
     inputSchema: { name: z.enum(["comfort", "jet", "night", "dry"]) },
   },
-  async ({ name }) => text(await post("/action/ac/preset", { name })),
+  async ({ name }) => (name === "jet" ? text(await post("/action/ac/preset", { name })) : acCommand("/action/ac/preset", { name })),
 );
 
 server.registerTool(
@@ -285,7 +310,7 @@ server.registerTool(
     description: "Re-transmit the full saved state (settings + airflow) to re-sync the AC, e.g. after a power cut.",
     inputSchema: {},
   },
-  async () => text(await post("/action/ac/resend")),
+  async () => acCommand("/action/ac/resend"),
 );
 
 // ── LG AC real state, directly from Fin-ESP's own ac_cloud module (READ-ONLY) ────────────────

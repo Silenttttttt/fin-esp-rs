@@ -7,8 +7,16 @@
 //!   Sign:8 (0x88) | Power:2 (0 on, 3 off) | :3 | Mode:3 | Temp:4 (C-15) | Fan:4 | Sum:4
 //!   Sum = sum of the 4 data nibbles & 0xF.
 //!
-//! IR is one-way: the AC never reports its state, so the state here IS the source of truth and
-//! is persisted to NVS. Every main frame carries the complete state (power+mode+temp+fan), so a
+//! IR itself is one-way, but the AC reports its real state over WiFi to Fin-ESP's own ac_cloud
+//! (src/ac_cloud/). That readback closes the loop (2026-10-27, after the AC silently missed frames
+//! while the dashboard and MCP kept reporting the requested temperature as done):
+//!   - every main frame is VERIFIED against the AC's reported power/mode/setpoint and re-sent
+//!     (it's an absolute frame, so a repeat is idempotent) until it matches or VERIFY_MAX_SENDS is
+//!     reached; then the command is reported as failed, never as done;
+//!   - when nothing is in flight and the AC reports something else (LG remote, a missed frame),
+//!     Fin-ESP adopts the AC's real values, so the dashboard always shows what the AC really has.
+//! Without a live readback (ac_cloud down) it degrades to the old single send, reported as
+//! "unverified". Every main frame carries the complete state (power+mode+temp+fan), so a
 //! send is idempotent and re-sending ("resend") re-normalizes the AC whatever it was doing.
 //! Toggle-type codes (light toggle, swing toggle) are deliberately never sent -- a toggle can't
 //! be normalized without feedback; swing uses LG's absolute position codes instead.
@@ -139,7 +147,10 @@ fn main_frame() -> u32 {
     // LG sets this bit on every settings change while the AC is already running and clears
     // it only on the frame that powers it on (Arduino-IRremote ac_LG.h LG_SWITCH_ON_MASK,
     // confirmed against Muni's AKB30086214: power-on 0x8800347, mode change while on 0x88083A5).
-    let running = if LAST_SENT_ON.load(Ordering::Relaxed) { 1 << 15 } else { 0 };
+    // The AC's own reported power wins over what we last sent: after a missed frame those differ,
+    // and the bit must describe the AC's real state for the frame to be a normal settings change.
+    let ac_on = crate::ac_cloud::readback().map(|r| r.power).unwrap_or(LAST_SENT_ON.load(Ordering::Relaxed));
+    let running = if ac_on { 1 << 15 } else { 0 };
     let v = (0x88 << 20) | running | (mode << 12) | ((temp - 15) << 8) | (fan << 4);
     v | checksum(v)
 }
@@ -147,6 +158,116 @@ fn main_frame() -> u32 {
 fn mark_main() {
     LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
     PENDING_MAIN.store(true, Ordering::Relaxed);
+}
+
+// ── Closed loop: verify every main frame against the AC's own readback ──────────────────────
+
+/// How long to wait for the AC to report a frame's settings before re-sending it. The AC reports
+/// a change within ~1-3 s when it took the frame (measured 2026-10-27).
+const VERIFY_WAIT_MS: u32 = 6_000;
+/// Total transmissions of one main frame before giving up and reporting failure.
+const VERIFY_MAX_SENDS: u8 = 4;
+/// Adopt the AC's reported state only after this long without any local change.
+const ADOPT_QUIET_MS: u32 = 8_000;
+
+const V_IDLE: u8 = 0;
+const V_WAITING: u8 = 1;
+const V_CONFIRMED: u8 = 2;
+const V_FAILED: u8 = 3;
+const V_UNVERIFIED: u8 = 4;
+static VERIFY: AtomicU8 = AtomicU8::new(V_IDLE);
+static VERIFY_SENDS: AtomicU8 = AtomicU8::new(0);
+static VERIFY_SINCE_MS: AtomicU32 = AtomicU32::new(0);
+/// Set by the verifier when it re-queues PENDING_MAIN, so the send counts as a retry.
+static RETRY_MAIN: AtomicBool = AtomicBool::new(false);
+/// What the last FAILED command asked for (packed like pack()), for status reporting.
+static FAILED_WANT: AtomicU32 = AtomicU32::new(0);
+/// How many times Fin-ESP's state was corrected from the AC's own report.
+static ADOPTED: AtomicU32 = AtomicU32::new(0);
+
+/// IR mode index (MODES) -> AC's TLV mode code (rethink RAC_056905_WW MODES).
+fn mode_tlv(idx: u8) -> u32 {
+    match idx { 0 => 0, 1 => 1, 2 => 2, 3 => 6, 4 => 4, _ => u32::MAX }
+}
+fn mode_from_tlv(t: u32) -> Option<u8> {
+    match t { 0 => Some(0), 1 => Some(1), 2 => Some(2), 6 => Some(3), 4 => Some(4), _ => None }
+}
+/// TLV fan code for each FANS entry (same order: lowest, low, medium, high, max, auto).
+const FAN_TLV: [u32; 6] = [2, 3, 4, 5, 6, 8];
+/// Only cool and heat hold a user setpoint; in dry/fan/auto LG ignores or overrides it.
+fn temp_applies(mode_idx: u8) -> bool { mode_idx == 0 || mode_idx == 4 }
+
+/// Does the AC's report match Fin-ESP's power/mode/setpoint?
+fn matches(rb: &crate::ac_cloud::Readback) -> bool {
+    let on = POWER.load(Ordering::Relaxed);
+    if rb.power != on { return false; }
+    if !on { return true; }
+    let mode = MODE.load(Ordering::Relaxed);
+    if rb.mode != mode_tlv(mode) { return false; }
+    !temp_applies(mode) || rb.target_half == Some(TEMP.load(Ordering::Relaxed) as u32 * 2)
+}
+
+/// Take the AC's reported power/mode/setpoint as Fin-ESP's state. Persists only on a real change.
+fn adopt(rb: &crate::ac_cloud::Readback, persist: &Persist) {
+    let before = pack();
+    POWER.store(rb.power, Ordering::Relaxed);
+    LAST_SENT_ON.store(rb.power, Ordering::Relaxed);
+    if let Some(m) = mode_from_tlv(rb.mode) { MODE.store(m, Ordering::Relaxed); }
+    if let Some(h) = rb.target_half {
+        let t = (h / 2) as u8;
+        if (TEMP_MIN..=TEMP_MAX).contains(&t) { TEMP.store(t, Ordering::Relaxed); }
+    }
+    if let Some(f) = rb.fan.and_then(|f| FAN_TLV.iter().position(|x| *x == f)) { FAN.store(f as u8, Ordering::Relaxed); }
+    if !rb.power && OFF_AT.load(Ordering::Relaxed) != 0 { sleep_in(0); }
+    if pack() != before {
+        ADOPTED.fetch_add(1, Ordering::Relaxed);
+        info!("[ac] state corrected from the AC's own report: {}", state_json());
+        persist.save_ac_state(pack());
+    }
+}
+
+/// Runs every sender-loop tick. Verifies the last main frame, re-sends it if the AC didn't take
+/// it, reports failure after VERIFY_MAX_SENDS, and otherwise keeps Fin-ESP's state equal to the AC's.
+fn closed_loop(persist: &Persist) {
+    if PENDING_MAIN.load(Ordering::Relaxed) { return; } // a newer change goes out (and is verified) first
+    let rb = crate::ac_cloud::readback();
+    let now = now_ms();
+    if VERIFY.load(Ordering::Relaxed) == V_WAITING {
+        let waited = now.wrapping_sub(VERIFY_SINCE_MS.load(Ordering::Relaxed));
+        let Some(rb) = rb else {
+            if waited >= VERIFY_WAIT_MS {
+                VERIFY.store(V_UNVERIFIED, Ordering::Relaxed);
+                warn!("[ac] no readback from the AC (ac_cloud not connected): frame sent once, unconfirmed");
+            }
+            return;
+        };
+        if matches(&rb) {
+            VERIFY.store(V_CONFIRMED, Ordering::Relaxed);
+            info!("[ac] AC confirmed the change (send {})", VERIFY_SENDS.load(Ordering::Relaxed));
+            return;
+        }
+        if waited < VERIFY_WAIT_MS { return; }
+        let sends = VERIFY_SENDS.load(Ordering::Relaxed);
+        if sends < VERIFY_MAX_SENDS {
+            warn!("[ac] AC still reports power={} mode={} target={:?} after send {sends}: re-sending",
+                rb.power, rb.mode, rb.target_half);
+            RETRY_MAIN.store(true, Ordering::Relaxed);
+            // Back-date so the sender doesn't wait SETTLE_MS for a retry.
+            LAST_CHANGE_MS.store(now.wrapping_sub(SETTLE_MS as u32), Ordering::Relaxed);
+            PENDING_MAIN.store(true, Ordering::Relaxed);
+        } else {
+            FAILED_WANT.store(pack(), Ordering::Relaxed);
+            VERIFY.store(V_FAILED, Ordering::Relaxed);
+            warn!("[ac] AC did not take the change after {sends} sends: reporting failure, adopting the AC's real state");
+            adopt(&rb, persist);
+        }
+        return;
+    }
+    let Some(rb) = rb else { return };
+    if now.wrapping_sub(LAST_CHANGE_MS.load(Ordering::Relaxed)) < ADOPT_QUIET_MS { return; }
+    if !matches(&rb) {
+        adopt(&rb, persist);
+    }
 }
 
 // ── State changes (any thread, never block) ──────────────────────────────────
@@ -289,8 +410,28 @@ pub fn resend() {
 
 /// JSON object for /status and /ac/state. Small, fixed-size format.
 pub fn state_json() -> String {
+    let verify = VERIFY.load(Ordering::Relaxed);
+    let rb = crate::ac_cloud::readback();
+    // What the AC itself reports right now (null = no live readback).
+    let real = match &rb {
+        Some(r) => std::format!(
+            r#"{{"on":{},"mode":"{}","temp":{},"fan":"{}"}}"#,
+            r.power,
+            mode_from_tlv(r.mode).map(|m| MODES[m as usize]).unwrap_or("other"),
+            r.target_half.map(|h| if h % 2 == 0 { (h / 2).to_string() } else { std::format!("{}.5", h / 2) }).unwrap_or_else(|| "null".into()),
+            r.fan.and_then(|f| FAN_TLV.iter().position(|x| *x == f)).map(|i| FANS[i].0).unwrap_or("other"),
+        ),
+        None => "null".into(),
+    };
+    let in_sync = match &rb { Some(r) => if matches(r) { "true" } else { "false" }, None => "null" };
+    let failed_want = match FAILED_WANT.load(Ordering::Relaxed) {
+        v if verify == V_FAILED && v >> 31 != 0 => std::format!(
+            r#"{{"on":{},"mode":"{}","temp":{}}}"#,
+            v & 1 != 0, MODES[((v >> 1) & 0x7) as usize % MODES.len()], (v >> 4) & 0x1F),
+        _ => "null".into(),
+    };
     std::format!(
-        r#"{{"on":{},"mode":"{}","temp":{},"fan":"{}","swing_v":"{}","swing_h":"{}","jet":{},"off_in_min":{},"auto_clean":{},"energy_saving":{},"power_limit":{},"sent":{},"pending":{}}}"#,
+        r#"{{"on":{},"mode":"{}","temp":{},"fan":"{}","swing_v":"{}","swing_h":"{}","jet":{},"off_in_min":{},"auto_clean":{},"energy_saving":{},"power_limit":{},"sent":{},"pending":{},"verify":"{}","tries":{},"in_sync":{},"real":{},"failed_want":{},"corrected":{}}}"#,
         POWER.load(Ordering::Relaxed),
         MODES[MODE.load(Ordering::Relaxed) as usize % MODES.len()],
         TEMP.load(Ordering::Relaxed),
@@ -303,7 +444,14 @@ pub fn state_json() -> String {
         ENERGY_SAVING.load(Ordering::Relaxed),
         POWER_LIMITS[POWER_LIMIT.load(Ordering::Relaxed) as usize % POWER_LIMITS.len()].0,
         SENT.load(Ordering::Relaxed),
-        PENDING_MAIN.load(Ordering::Relaxed) || PENDING_SWING_V.load(Ordering::Relaxed) || PENDING_SWING_H.load(Ordering::Relaxed),
+        PENDING_MAIN.load(Ordering::Relaxed) || PENDING_SWING_V.load(Ordering::Relaxed) || PENDING_SWING_H.load(Ordering::Relaxed)
+            || verify == V_WAITING,
+        ["idle", "waiting", "confirmed", "failed", "unverified"][verify as usize % 5],
+        VERIFY_SENDS.load(Ordering::Relaxed),
+        in_sync,
+        real,
+        failed_want,
+        ADOPTED.load(Ordering::Relaxed),
     )
 }
 
@@ -571,6 +719,7 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 std::thread::sleep(Duration::from_millis(30));
                 sniff_poll();
                 sleep_poll(&persist);
+                closed_loop(&persist);
                 if PENDING_IR_SELFTEST.swap(false, Ordering::Relaxed) {
                     // Deliberately NO blank_for() AND no loop_arm/loop_finish here: the loopback
                     // ISR shares GPIO32 with ir_remote.rs's own polling PinDriver, and enabling it
@@ -612,6 +761,11 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 let mut frames: heapless_frames::Frames = Default::default();
                 let mut main_on: Option<bool> = None;
                 if PENDING_MAIN.swap(false, Ordering::Relaxed) {
+                    if RETRY_MAIN.swap(false, Ordering::Relaxed) {
+                        VERIFY_SENDS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        VERIFY_SENDS.store(1, Ordering::Relaxed);
+                    }
                     frames.push(main_frame());
                     main_on = Some(POWER.load(Ordering::Relaxed));
                     JET.store(false, Ordering::Relaxed); // any settings frame ends Jet, like the remote
@@ -655,7 +809,12 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                         Err(e) => warn!("[ac] send 0x{code:07X} failed: {e:?}"),
                     }
                 }
-                if let Some(on) = main_on { LAST_SENT_ON.store(on, Ordering::Relaxed); }
+                if let Some(on) = main_on {
+                    LAST_SENT_ON.store(on, Ordering::Relaxed);
+                    // Verification clock starts once the frame (and any extras) actually went out.
+                    VERIFY_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+                    VERIFY.store(V_WAITING, Ordering::Relaxed);
+                }
                 if jet_sent { JET.store(true, Ordering::Relaxed); LAST_SENT_ON.store(true, Ordering::Relaxed); }
                 persist.save_ac_state(pack());
             }
