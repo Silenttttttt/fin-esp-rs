@@ -12,7 +12,7 @@ external resistor needed.
 |--------|----------------------|------|
 | Red    | Lamp toggle (Tuya)   | 12   |
 | Black  | Flashes and clears the red LED (its OTHER feature, LCD screen-cycling, is dead since the LCD is disconnected — but the LED clear itself is real, intentional functionality, not a no-op) | 26 |
-| Blue   | Media play/pause     | 27   |
+| Blue   | LG AC on/off (on = cool 21C) — was media play/pause until 2026-10-26 | 27   |
 | White  | Bright White preset  | 14   |
 | Yellow | Warm Dim preset      | 13   |
 
@@ -43,6 +43,20 @@ web-triggered `/action/display/*` route still works unchanged (it never depended
 
 Single bidirectional data line (bit-banged, `input_output_od` with internal pull-up) — VDD to
 3.3V, GND to GND, no other wiring needed.
+
+## IR (LG air conditioner + Keyes remote)
+
+| Function | Module pin -> board | GPIO |
+|---|---|---|
+| IR LED transmitter (KY-005), drives the LG AC | S -> GPIO2 (D2), middle (+) -> **5V/VIN**, - -> GND | 2 |
+| IR receiver (KY-022), Keyes remote input | S -> GPIO32, middle -> **3V3**, - -> GND | 32 |
+
+Added 2026-10-26: GPIO2 is a strapping pin, but fine here -- the LED module pulls it LOW (the
+safe direction; the receiver on GPIO2 broke boot because it drives it HIGH). The onboard blue LED
+shares GPIO2 and flickers with each send. The IR LED needs 5V (on 3.3V it runs under its rating and the signal is weak,
+learned on the bench board). Aim it at the AC's receiver window, close, clear line of sight --
+IR is one-way, a missed frame is never reported (see src/ac.rs). The receiver moved onto GPIO32
+on 2026-10-07 when the DHT22 was removed (the DHT22 section below is historical).
 
 ## LEDs (output)
 

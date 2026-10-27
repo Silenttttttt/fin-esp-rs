@@ -82,12 +82,20 @@ LAPTOP_IP=<LAN IP of your laptop, for media button>
 ```bash
 cd fin-esp-rs
 
-# USB
-./flash.sh usb /dev/ttyUSB0
-
-# OTA (after first USB flash)
+# OTA — the normal way, always use this
 ./flash.sh <ESP32_IP>
+
+# USB — only for a first flash / unbrick
+./flash.sh usb /dev/ttyUSB0
 ```
+
+LG air conditioner (IR): see `fin-esp-rs/docs/LG_AC_IR.md` for protocol, every code and test results.
+
+**Flash over OTA, not USB.** Fin-ESP browns out on USB serial at high baud (any esptool
+operation at 460800/921600, including a read-only `read-flash` dump). Confirmed twice on
+2026-10-26: the board dropped off USB mid-dump and rebooted. If USB is truly unavoidable,
+use `--baud 115200`. A full 4 MB flash backup taken 2026-10-26 is at
+`../Fin-ESP/backups/fin-esp-full-2026-10-26-a.bin` (single read, not double-verified).
 
 ### Media bridge (laptop side)
 

@@ -1,3 +1,4 @@
+mod ac;
 mod api;
 mod cache;
 mod cgram;
@@ -150,7 +151,8 @@ fn main() {
     let btn_screen  = PinDriver::input(peripherals.pins.gpio26, Pull::Up).unwrap();
     let btn_light   = PinDriver::input(peripherals.pins.gpio12, Pull::Up).unwrap();
     // Removed 2026-08-30: was the (never physically wired) Display power button, on GPIO32.
-    // Freed for the DHT22 sensor's data line instead - see dht22.rs. The web-triggered
+    // Freed for the DHT22 sensor's data line, then re-freed 2026-10-07 when DHT22 was replaced
+    // by the IR receiver (see ir_remote::spawn_ir_remote_reader below). The web-triggered
     // `/action/display/*` path (unrelated to this physical pin) still works below.
     let btn_warm    = PinDriver::input(peripherals.pins.gpio13, Pull::Up).unwrap();
     // Moved 2026-08-29 from gpio4/gpio19 (opposite side of the board from the other buttons)
@@ -379,12 +381,17 @@ fn main() {
     // Media server — laptop connects here and receives "p\n" on button press.
     spawn_media_server();
 
-    // Temp/humidity sensor — GPIO32, freed from the (never-wired) Display button above.
-    dht22::spawn_dht22_reader(peripherals.pins.gpio32);
+    // DHT22 temp/humidity sensor removed 2026-10-07 -- GPIO32 reused for the IR receiver
+    // instead (see the ir_remote::spawn_ir_remote_reader call below). See
+    // config::DHT22_ENABLED's own comment for the full reasoning and what still runs anyway
+    // (chart-cache refresher, /dht/chart* routes).
+    if !config::DHT22_ENABLED {
+        info!("[boot] DHT22 disabled (config::DHT22_ENABLED=false) -- GPIO32 now owned by ir_remote");
+    }
 
     // Shared state
     let ui_state   = Arc::new(Mutex::new(screen::UiState::default()));
-    let lamp_handle = Arc::new(tuya::LampHandle::new());
+    let lamp_handle = Arc::new(tuya::LampHandle::new(persist.clone()));
     let led_state   = Arc::new(led::LedState::new());
 
     // The price-fetch cycle and the Tuya lamp bridge's own independent 5s
@@ -419,23 +426,35 @@ fn main() {
     // Mic/lamp server — accepts "m:0", "m:1" (mic LED), "l:t" (lamp toggle).
     spawn_mic_server(Arc::clone(&lamp_handle), Arc::clone(&ui_state), Arc::clone(&led_state));
 
-    // IR remote (KY-022 receiver, GPIO4) — bench-tested extensively on identical hardware
-    // before this integration; see esp32-tests/ir_receiver_test/ in the sibling Fin-ESP repo
-    // for the wiring, the button-code capture/verification, and why GPIO4 specifically (not
-    // a boot-strapping pin, unlike GPIO2/5). Dispatches into the same LampHandle/media actions
-    // the physical buttons and web UI already use — a second way to trigger existing
-    // behavior, not a parallel system.
-    ir_remote::spawn_ir_remote_reader(peripherals.pins.gpio4, Arc::clone(&lamp_handle), Arc::clone(&led_state), &PLAY_PAUSE_READY);
+    // IR remote (KY-022 receiver) — bench-tested extensively on identical hardware before
+    // this integration; see esp32-tests/ir_receiver_test/ in the sibling Fin-ESP repo for the
+    // wiring and the button-code capture/verification. Dispatches into the same LampHandle/
+    // media actions the physical buttons and web UI already use — a second way to trigger
+    // existing behavior, not a parallel system.
+    // Moved 2026-10-07 from GPIO4 to GPIO32 (DHT22's old data line, now free -- see
+    // config::DHT22_ENABLED) when the DHT22 sensor was physically replaced by this receiver.
+    // GPIO4 itself is free again as of this change. GPIO32 is boot-safe (not a strapping pin),
+    // same requirement that ruled out GPIO2/5 for this originally.
+    ir_remote::spawn_ir_remote_reader(peripherals.pins.gpio32, Arc::clone(&lamp_handle), Arc::clone(&led_state), &PLAY_PAUSE_READY);
 
-    // INMP441 I2S mic -> continuous raw-PCM push to Jarvis. UNTESTED as of 2026-10-05 -- see
-    // mic_capture.rs's own header for the full reasoning (pin choices, format, transport shape,
-    // and the explicitly-still-open core-pinning question) before touching this.
-    mic_capture::spawn_mic_capture(
-        peripherals.i2s0,
-        peripherals.pins.gpio16,
-        peripherals.pins.gpio17,
-        peripherals.pins.gpio21,
-    );
+    // INMP441 I2S mic -> continuous raw-PCM push to Jarvis. UNTESTED as of 2026-10-05, DISABLED
+    // 2026-10-07 (see config::FIN_ESP_MIC_ENABLED's own comment -- no real mic is wired here,
+    // and leaving this spawning was found live to be interfering with Jarvis's wake-word
+    // detection via the real bench-test board). See mic_capture.rs's own header for the full
+    // reasoning (pin choices, format, transport shape) before ever re-enabling this.
+    if config::FIN_ESP_MIC_ENABLED {
+        mic_capture::spawn_mic_capture(
+            peripherals.i2s0,
+            peripherals.pins.gpio16,
+            peripherals.pins.gpio17,
+            peripherals.pins.gpio21,
+        );
+    }
+
+    // LG AC over IR (IR LED module on GPIO2, 5V -- strapping pin, but the module pulls it LOW,
+    // the safe direction; the onboard blue LED on GPIO2 flickers with each send) -- Fin-ESP is the AC's only controller, see
+    // ac.rs's header. Loads persisted state, never transmits on boot.
+    ac::spawn(peripherals.rmt.channel0, peripherals.pins.gpio2, persist.clone());
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 
@@ -948,7 +967,7 @@ fn main() {
         }
         last_btn_light = light;
 
-        // ── Display power (web-triggered only - GPIO32 is now the DHT22's data line) ──
+        // ── Display power (web-triggered only - GPIO32 is now the IR receiver's pin) ──
         let web_display_raw = if config::WEB_SERVER_ENABLED { web_triggers.display.swap(-1, Ordering::Relaxed) } else { -1i8 };
         let web_display = web_display_raw >= 0;
         if web_display {
@@ -1053,7 +1072,10 @@ fn main() {
         }
         last_btn_chart = chart_btn;
 
-        // ── Media play/pause button (GPIO 27, active LOW) ────────────────────
+        // ── Blue button (GPIO 27, active LOW): LG AC on/off ───────────────────
+        // Repurposed 2026-10-26 (Muni): was media play/pause; now toggles the AC (on = cool
+        // 21C, see ac::button_toggle). Web/IR-remote play/pause (web_triggers.media,
+        // PLAY_PAUSE_READY) are unchanged -- only the physical button moved to the AC.
         let media_raw = btn_media.is_high();
         if media_raw != media_raw_last {
             media_raw_last = media_raw;
@@ -1066,9 +1088,15 @@ fn main() {
             }
             media_stable_state = media_raw;
         }
+        if phys_media {
+            let on = ac::button_toggle();
+            info!("[btn] AC {} (physical)", if on { "on" } else { "off" });
+            api::report_event("button_press", "info", std::format!("AC {} (button)", if on { "on" } else { "off" }), "physical");
+            let _ = led_red.set_high(); FreeRtos::delay_ms(80); let _ = led_red.set_low(); led_state.set_red(false); last_hw_red = false;
+        }
         let web_media  = config::WEB_SERVER_ENABLED && web_triggers.media.swap(false, Ordering::Relaxed);
-        if phys_media || web_media {
-            info!("[btn] media play/pause ({})", if web_media { "web" } else { "physical" });
+        if web_media {
+            info!("[btn] media play/pause (web)");
             if web_media {
                 let origin = web_triggers.last_origin_external.load(Ordering::Relaxed);
                 api::report_event(

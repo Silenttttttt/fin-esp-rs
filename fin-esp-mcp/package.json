@@ -1,0 +1,11 @@
+{
+  "name": "fin-esp-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Fin-ESP (lamp, status LEDs, LG air conditioner)",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.1"
+  }
+}

@@ -6,16 +6,18 @@
 //! `esp32-tests/ir_receiver_test/` in the sibling Fin-ESP repo -- this module only implements
 //! decode + dispatch, not the discovery work.
 //!
-//! Wiring: receiver S -> GPIO4 (confirmed safe, non-strapping, already bench-tested extensively
-//! on identical hardware), VCC -> 3.3V (not 5V -- see that repo's NOTES.md for why), GND -> GND.
+//! Wiring: receiver S -> GPIO32 (moved 2026-10-07 from GPIO4 when this receiver physically
+//! replaced the DHT22 sensor that used to own GPIO32 -- see config::DHT22_ENABLED; GPIO32 is
+//! boot-safe/non-strapping, same requirement GPIO4 satisfied originally), VCC -> 3.3V (not 5V
+//! -- see that repo's NOTES.md for why), GND -> GND.
 
-use esp_idf_hal::gpio::{Input, PinDriver, Pull};
+use esp_idf_hal::gpio::{Gpio32, Input, PinDriver, Pull};
 use log::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::led::LedState;
-use crate::tuya::{LampHandle, LAMP_UNKNOWN};
+use crate::tuya::LampHandle;
 
 #[derive(Debug)]
 enum IrError {
@@ -99,44 +101,14 @@ fn read_nec_frame(pin: &PinDriver<'_, Input>) -> Result<(u8, u8), IrError> {
     Ok((address, command))
 }
 
-/// Nudges the lamp's custom-white brightness/temp by `delta`, clamped to the Tuya range,
-/// carrying the other axis forward unchanged. Falls back to a mid-point start (500) the first
-/// time either axis is touched, matching LAMP_UNKNOWN's "never set" meaning elsewhere.
-fn step_brightness_temp(lamp_handle: &LampHandle, brightness_delta: i32, temp_delta: i32) {
-    use std::sync::atomic::Ordering;
-    let cur_b = lamp_handle.last_brightness.load(Ordering::Relaxed);
-    let cur_b = if cur_b == LAMP_UNKNOWN { 500 } else { cur_b };
-    let cur_t = lamp_handle.last_temp.load(Ordering::Relaxed);
-    let cur_t = if cur_t == LAMP_UNKNOWN { 500 } else { cur_t };
-    let new_b = (cur_b as i32 + brightness_delta).clamp(10, 1000) as u16;
-    let new_t = (cur_t as i32 + temp_delta).clamp(0, 1000) as u16;
-    lamp_handle.queue_brightness_temp(new_b, new_t);
-}
-
 // Real bug found live (2026-09-22): queue_brightness_temp() always sends "21":"white" (see
 // LampHandle::poll()'s target==4 arm in tuya/mod.rs), so stepping "brightness" while a color
-// was active silently forced the bulb back to white mode, discarding the color. LampHandle
-// doesn't expose which mode is currently active, so this thread tracks it locally -- true
-// whenever THIS remote's own digit buttons last picked a color, false whenever it last picked
-// a white-mode preset/toggle. Not perfectly authoritative if something else (physical
-// buttons, web UI) changes the mode in between, but correct for the actual reported case:
-// using this same remote to pick a color, then adjust its brightness with the same remote.
-static IN_COLOUR_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static LAST_HUE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-static LAST_VAL: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1000);
-
-/// Nudges the colour mode's V (value/brightness in HSV) by `delta`, keeping the current hue
-/// and full saturation, so "brightness" while on a color dims/brightens that color instead of
-/// switching to white.
-fn step_colour_value(lamp_handle: &LampHandle, delta: i32) {
-    use std::sync::atomic::Ordering;
-    let hue = LAST_HUE.load(Ordering::Relaxed);
-    let cur_val = LAST_VAL.load(Ordering::Relaxed);
-    let new_val = (cur_val as i32 + delta).clamp(10, 1000) as u16;
-    LAST_VAL.store(new_val, Ordering::Relaxed);
-    lamp_handle.queue_colour(hue, 1000, new_val);
-}
-
+// was active silently forced the bulb back to white mode, discarding the color. This used to
+// be worked around with local, per-module tracking right here (IN_COLOUR_MODE/LAST_HUE/
+// LAST_VAL statics), explicitly "not perfectly authoritative if something else (physical
+// buttons, web UI) changes the mode in between". Centralized 2026-10-07 into
+// `LampHandle::step_brightness()` instead -- see that method's own comment -- so it's correct
+// for any caller (this remote, the web UI, Jarvis), not just this one.
 const STEP: i32 = 80; // ~8% of the 10-1000 Tuya range per press -- a few presses to notice, not one
 
 // This desktop's own media/volume machine_id -- the laptop bridge protocol identifies
@@ -183,41 +155,33 @@ fn digit_hue(command: u8) -> Option<u16> {
 fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static std::sync::atomic::AtomicBool) {
     match command {
         0x45 => {
-            // 1 (swapped with ok 2026-09-22) -- toggle
+            // 1 (swapped with ok 2026-09-22) -- toggle. Deliberately does NOT reset colour
+            // mode (power on/off alone doesn't touch DPS 21/24 on the actual device) -- a
+            // behavior correction from before centralizing, see LampHandle::step_brightness's
+            // own comment.
             let current_on = lamp_handle.display_state().on;
             lamp_handle.flip_target(current_on);
-            IN_COLOUR_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
             info!("[ir] 1 -> lamp toggle");
         }
         0x16 => {
             // *
             lamp_handle.queue_warm_dim();
-            IN_COLOUR_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
             info!("[ir] * -> warm dim preset");
         }
         0x0D => {
             // #
             lamp_handle.queue_bright_white();
-            IN_COLOUR_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
             info!("[ir] # -> bright white preset");
         }
         0x18 => {
             // up -- steps colour's V if a color is active, brightness otherwise (see
-            // IN_COLOUR_MODE's own comment for why this distinction is necessary)
-            if IN_COLOUR_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-                step_colour_value(lamp_handle, STEP);
-            } else {
-                step_brightness_temp(lamp_handle, STEP, 0);
-            }
+            // LampHandle::step_brightness's own comment for why this distinction is necessary)
+            lamp_handle.step_brightness(STEP);
             info!("[ir] up -> brightness+");
         }
         0x52 => {
             // down
-            if IN_COLOUR_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-                step_colour_value(lamp_handle, -STEP);
-            } else {
-                step_brightness_temp(lamp_handle, -STEP, 0);
-            }
+            lamp_handle.step_brightness(-STEP);
             info!("[ir] down -> brightness-");
         }
         0x5A => {
@@ -243,12 +207,10 @@ fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static st
         }
         _ => {
             // Remaining digit buttons (2-9) each set the lamp to a distinct color -- see
-            // digit_hue()'s own comment for the rainbow spread.
+            // digit_hue()'s own comment for the rainbow spread. queue_colour() itself now
+            // marks colour mode active (see LampHandle::last_mode_is_colour), no separate
+            // local tracking needed here anymore.
             if let Some(hue) = digit_hue(command) {
-                use std::sync::atomic::Ordering;
-                LAST_HUE.store(hue, Ordering::Relaxed);
-                LAST_VAL.store(1000, Ordering::Relaxed);
-                IN_COLOUR_MODE.store(true, Ordering::Relaxed);
                 lamp_handle.queue_colour(hue, 1000, 1000);
                 info!("[ir] digit -> color hue={hue}");
             }
@@ -257,7 +219,7 @@ fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static st
 }
 
 pub fn spawn_ir_remote_reader(
-    pin: esp_idf_hal::gpio::Gpio4<'static>,
+    pin: Gpio32<'static>,
     lamp_handle: Arc<LampHandle>,
     led_state: Arc<LedState>,
     play_pause_ready: &'static std::sync::atomic::AtomicBool,
@@ -293,6 +255,11 @@ pub fn spawn_ir_remote_reader(
             };
             info!("[ir] remote receiver ready on GPIO4");
             loop {
+                // Our own LG AC frames (IR LED cm away, see ac.rs) aren't remote presses.
+                if crate::ac::tx_blanking() {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 if driver.is_low() {
                     match read_nec_frame(&driver) {
                         Ok((address, command)) => {

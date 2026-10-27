@@ -192,6 +192,26 @@ pub const POT_TOGGLE_ENABLED: bool = false;
 // thread was always one of the biggest single heap/CPU consumers on this device (real crypto
 // work every handshake, its own network_lock contention) - flip back to true to re-enable.
 pub const EXPROTOCOL_ENABLED: bool = false;
+// DHT22 temp/humidity sensor physically removed 2026-10-07, its GPIO32 data line reused for
+// the IR receiver instead (see ir_remote.rs / main.rs). Unlike DISPLAY_TOGGLE_ENABLED/
+// POT_TOGGLE_ENABLED above, there's no remaining button/action whose effect this flag can gate
+// at runtime -- GPIO32 is now physically owned by ir_remote, so dht22::spawn_dht22_reader is no
+// longer called at all (not just gated), and the dashboard's Climate card was removed outright
+// from web.rs (same "UI's use of them was removed" treatment Display/Pot's card got, see that
+// comment). This flag exists purely so the boot log says so explicitly and so this is documented
+// the same "kept, not removed" way as the flags above, in case the sensor is ever reconnected.
+// The chart-cache refresher and /dht/chart* routes stay running/intact regardless, serving
+// whatever history was already logged before the sensor came out.
+pub const DHT22_ENABLED: bool = false;
+// INMP441 mic capture -- UNTESTED draft (2026-10-05), no physical mic ever wired to this
+// device's GPIO16/17/21. Real bug found live 2026-10-07: this was still spawning on every
+// boot, meaning Fin-ESP had an active TCP connection to Jarvis's mic listener (port 9878)
+// pushing garbage/empty I2S reads the whole time two unrelated OTA deploys went out -- almost
+// certainly contributing to (or outright causing) a reported wake-word-detection failure,
+// since Jarvis's receiver was getting 3 simultaneous connections (this one plus two from the
+// real bench-test board) instead of one. Disabled until real hardware is actually wired here;
+// the bench-test board (rust_bench_test, a separate project) is the one with a real mic today.
+pub const FIN_ESP_MIC_ENABLED: bool = false;
 // Crypto/gold/oil/USD-BRL price fetching - disabled per direct request 2026-08-30
 // ("we're not even using any of that"), same "kept, not removed" pattern as the flags above so
 // it can come back with one flip if that changes. When false, main.rs never spawns the finFetch

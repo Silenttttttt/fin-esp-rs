@@ -4,12 +4,13 @@ mod session;
 
 use log::warn;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 255 = unknown (never set by web)
 pub const LAMP_UNKNOWN: u32 = 255;
 
 use crate::config;
+use crate::persist::Persist;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LampState {
@@ -48,10 +49,27 @@ pub struct LampHandle {
 
     pub last_brightness: AtomicU32,
     pub last_temp:       AtomicU32,
+
+    // Centralized 2026-10-07 -- previously only ir_remote.rs tracked "is the lamp currently in
+    // colour mode" (its own local IN_COLOUR_MODE static), discovered as a real bug 2026-09-22:
+    // nudging "brightness" while a color was active used to silently force the bulb back to
+    // white mode, since queue_brightness_temp() always sends "21":"white". That local tracking
+    // was explicitly "not perfectly authoritative if something else (physical buttons, web UI)
+    // changes the mode in between" -- moving it here makes it correct for ANY caller (IR
+    // remote, web UI, Jarvis, anything else), not just the one that happened to set it last.
+    // 2026-10-09, real bug found live: this (and the custom_* values below) used to be purely
+    // in-memory, resetting to hardcoded defaults on every Fin-ESP reboot -- including the
+    // already-known background crash-reboot bug -- while the REAL lamp doesn't forget its own
+    // state on FIN-ESP's reboot. The next brightness press after any such reboot would
+    // incorrectly take the white-mode branch and force the lamp to white, looking exactly like
+    // "brightness sometimes changes the colour". See persist.rs's own comment on these fields.
+    // Persisted now, loaded in `new()`, saved on every queue_colour/queue_brightness_temp call.
+    last_mode_is_colour: AtomicBool,
+    persist: Persist,
 }
 
 impl LampHandle {
-    pub fn new() -> Self {
+    pub fn new(persist: Persist) -> Self {
         Self {
             ip:      config::TUYA_DEVICE_IP,
             port:    config::TUYA_DEVICE_PORT,
@@ -62,13 +80,15 @@ impl LampHandle {
             suppress_until_ms: AtomicU32::new(0),
             retry_after_ms:    AtomicU32::new(0),
             sess:              Mutex::new(None),
-            custom_brightness: AtomicU32::new(500),
-            custom_temp:       AtomicU32::new(500),
-            custom_hue:        AtomicU32::new(30),
-            custom_sat:        AtomicU32::new(1000),
-            custom_val:        AtomicU32::new(500),
+            custom_brightness: AtomicU32::new(persist.load_lamp_brightness().unwrap_or(500) as u32),
+            custom_temp:       AtomicU32::new(persist.load_lamp_temp().unwrap_or(500) as u32),
+            custom_hue:        AtomicU32::new(persist.load_lamp_hue().unwrap_or(30) as u32),
+            custom_sat:        AtomicU32::new(persist.load_lamp_sat().unwrap_or(1000) as u32),
+            custom_val:        AtomicU32::new(persist.load_lamp_val().unwrap_or(500) as u32),
             last_brightness:   AtomicU32::new(LAMP_UNKNOWN),
             last_temp:         AtomicU32::new(LAMP_UNKNOWN),
+            last_mode_is_colour: AtomicBool::new(persist.load_lamp_mode_is_colour()),
+            persist,
         }
     }
 
@@ -165,33 +185,75 @@ impl LampHandle {
 
     pub fn queue_warm_dim(&self) {
         *self.target.lock().unwrap() = 2;
+        self.last_mode_is_colour.store(false, Ordering::Relaxed);
         self.retry_after_ms.store(0, Ordering::Relaxed);
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
     }
 
     pub fn queue_bright_white(&self) {
         *self.target.lock().unwrap() = 3;
+        self.last_mode_is_colour.store(false, Ordering::Relaxed);
         self.retry_after_ms.store(0, Ordering::Relaxed);
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
     }
 
     /// Set brightness (10–1000 Tuya) and color temperature (0=warm … 1000=cool).
     pub fn queue_brightness_temp(&self, brightness: u16, temp: u16) {
-        self.custom_brightness.store(brightness.clamp(10, 1000) as u32, Ordering::Relaxed);
-        self.custom_temp.store(temp.clamp(0, 1000) as u32, Ordering::Relaxed);
+        let brightness = brightness.clamp(10, 1000);
+        let temp = temp.clamp(0, 1000);
+        self.custom_brightness.store(brightness as u32, Ordering::Relaxed);
+        self.custom_temp.store(temp as u32, Ordering::Relaxed);
         *self.target.lock().unwrap() = 4;
+        self.last_mode_is_colour.store(false, Ordering::Relaxed);
         self.retry_after_ms.store(0, Ordering::Relaxed);
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+        self.persist.save_lamp_brightness(brightness);
+        self.persist.save_lamp_temp(temp);
+        self.persist.save_lamp_mode_is_colour(false);
     }
 
     /// Set colour mode with HSV in Tuya units (hue 0–360, sat 0–1000, val 0–1000).
     pub fn queue_colour(&self, hue: u16, sat: u16, val: u16) {
-        self.custom_hue.store(hue.clamp(0, 360) as u32, Ordering::Relaxed);
-        self.custom_sat.store(sat.clamp(0, 1000) as u32, Ordering::Relaxed);
-        self.custom_val.store(val.clamp(0, 1000) as u32, Ordering::Relaxed);
+        let hue = hue.clamp(0, 360);
+        let sat = sat.clamp(0, 1000);
+        let val = val.clamp(0, 1000);
+        self.custom_hue.store(hue as u32, Ordering::Relaxed);
+        self.custom_sat.store(sat as u32, Ordering::Relaxed);
+        self.custom_val.store(val as u32, Ordering::Relaxed);
         *self.target.lock().unwrap() = 5;
+        self.last_mode_is_colour.store(true, Ordering::Relaxed);
         self.retry_after_ms.store(0, Ordering::Relaxed);
         self.suppress_until_ms.store(now_ms().wrapping_add(10_000), Ordering::Relaxed);
+        self.persist.save_lamp_hue(hue);
+        self.persist.save_lamp_sat(sat);
+        self.persist.save_lamp_val(val);
+        self.persist.save_lamp_mode_is_colour(true);
+    }
+
+    /// Nudge brightness by `delta` (Tuya 10-1000 range) without needing to know the lamp's
+    /// current color -- the single authoritative replacement for what used to be ir_remote.rs's
+    /// own local, non-authoritative IN_COLOUR_MODE/LAST_HUE/LAST_VAL tracking (see
+    /// `last_mode_is_colour`'s own comment). Works correctly from ANY caller: in colour mode,
+    /// nudges V (brightness-in-HSV) while keeping the current hue/saturation exactly as last
+    /// set; in white mode, nudges brightness while keeping the current color temp exactly as
+    /// last applied (reading `last_brightness`/`last_temp`, not the `custom_*` staging fields,
+    /// so this is correct even right after a warm_dim/bright_white preset, which bypass
+    /// `custom_brightness`/`custom_temp` entirely).
+    pub fn step_brightness(&self, delta: i32) {
+        if self.last_mode_is_colour.load(Ordering::Relaxed) {
+            let hue = self.custom_hue.load(Ordering::Relaxed) as u16;
+            let sat = self.custom_sat.load(Ordering::Relaxed) as u16;
+            let cur_val = self.custom_val.load(Ordering::Relaxed) as i32;
+            let new_val = (cur_val + delta).clamp(10, 1000) as u16;
+            self.queue_colour(hue, sat, new_val);
+        } else {
+            let cur_b = self.last_brightness.load(Ordering::Relaxed);
+            let cur_b = if cur_b == LAMP_UNKNOWN { 500 } else { cur_b as i32 };
+            let cur_t = self.last_temp.load(Ordering::Relaxed);
+            let cur_t = if cur_t == LAMP_UNKNOWN { 500 } else { cur_t } as u16;
+            let new_b = (cur_b + delta).clamp(10, 1000) as u16;
+            self.queue_brightness_temp(new_b, cur_t);
+        }
     }
 
     /// Last applied brightness as 0–100 percentage (LAMP_UNKNOWN if never set).

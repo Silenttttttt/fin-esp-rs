@@ -160,6 +160,26 @@ button:active{opacity:.72;transform:scale(.96)}
   background:linear-gradient(135deg,#2a1a4a,#1a1a3a);
   border-color:rgba(139,92,246,.3)}
 .media-btn:hover{border-color:var(--acc)}
+.ac-temp{display:flex;align-items:center;justify-content:center;gap:1.1rem;margin:.3rem 0 1rem}
+.ac-tbtn{width:3rem;height:3rem;border-radius:50%;font-size:1.5rem;padding:0;line-height:1}
+.ac-tc{display:flex;flex-direction:column;align-items:center;min-width:6rem}
+.ac-t{font-size:2.7rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.ac-mode{font-size:.7rem;color:var(--dim);margin-top:.25rem;text-transform:uppercase;letter-spacing:.08em}
+.ac-scenes{display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem;margin-bottom:.85rem}
+.ac-scenes button{display:flex;flex-direction:column;align-items:center;gap:.25rem;padding:.65rem .2rem;font-size:.72rem;line-height:1.1}
+.ac-scenes button b{font-size:1.3rem;font-weight:400}
+.ac-scenes button.act{background:var(--acc);border-color:var(--acc2);color:#fff;box-shadow:0 0 14px rgba(139,92,246,.45)}
+.ac-auto{display:flex;align-items:center;gap:.5rem}
+.ac-auto .sl-l{width:4rem;flex-shrink:0}
+.ac-row{display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.4rem}
+.ac-row .sl-l{width:5.2rem;padding-top:.3rem;flex-shrink:0}
+.card.cold{box-shadow:0 0 50px -14px rgba(56,189,248,.35),inset 0 1px 0 rgba(255,255,255,.04)}
+.ac-note{font-size:.68rem;color:var(--dim);margin-top:.6rem;text-align:center}
+.ac-xbtns{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.5rem}
+.ac-xbtns button{font-size:.74rem}
+.ac-more{margin-top:.7rem;border-top:1px solid var(--bd);padding-top:.3rem}
+.ac-more summary{font-size:.75rem;color:var(--dim);cursor:pointer;padding:.45rem 0;list-style-position:inside}
+.ac-more[open] summary{margin-bottom:.5rem}
 </style>
 </head>
 <body>
@@ -205,28 +225,68 @@ button:active{opacity:.72;transform:scale(.96)}
   </div>
 </div>
 
-<div class="card">
-  <div class="ch"><h2>Climate</h2></div>
-  <div class="prices">
-    <div class="pr"><span class="pr-n">Temp</span><span class="pr-v" id="tempv">--</span></div>
-    <div class="pr"><span class="pr-n">Humidity</span><span class="pr-v" id="humv">--</span></div>
+<div class="card" id="accard">
+  <div class="ch">
+    <h2>Air Conditioner</h2>
+    <label class="sw">
+      <input type="checkbox" id="acpwr" onchange="if(!_upd)post('/action/ac/'+(this.checked?'on':'off')).then(refresh)">
+      <span class="sw-t"></span><span class="sw-k"></span>
+    </label>
   </div>
-  <div class="chart-legend">
-    <span class="lg-dot" style="background:#f97316"></span><span class="lg-l">Temp (&deg;C)</span>
-    <span class="lg-dot" style="background:#38bdf8"></span><span class="lg-l">Humidity (%)</span>
+  <div class="ac-temp">
+    <button class="ac-tbtn" onclick="acPost('/action/ac/temp?delta=-1')">&minus;</button>
+    <div class="ac-tc"><span class="ac-t" id="act">--</span><span class="ac-mode" id="acmodelbl"></span></div>
+    <button class="ac-tbtn" onclick="acPost('/action/ac/temp?delta=1')">+</button>
   </div>
-  <div class="climchart-wrap" id="climchartwrap">
-    <svg id="climchart" viewBox="0 0 300 90" preserveAspectRatio="none" class="climchart"></svg>
+  <div class="ac-scenes">
+    <button id="acjet" onclick="acPost('/action/ac/preset?name=jet')"><b>&#10052;&#65039;</b>Cool fast</button>
+    <button onclick="acPost('/action/ac/preset?name=comfort')"><b>&#128522;</b>Comfort</button>
+    <button onclick="acPost('/action/ac/preset?name=night')"><b>&#127769;</b>Night</button>
+    <button onclick="acPost('/action/ac/preset?name=dry')"><b>&#128167;</b>Dry air</button>
   </div>
-  <div class="pr-n" id="chartrange" style="text-align:center;margin-top:.3rem"></div>
-  <div class="chart-meta" id="chartmeta"></div>
-  <div class="pills" id="chartRangeBtns" style="justify-content:center;margin-top:.4rem">
-    <button data-h="0" class="act" onclick="loadRange(0)">Live</button>
-    <button data-h="1" onclick="loadRange(1)">1h</button>
-    <button data-h="6" onclick="loadRange(6)">6h</button>
-    <button data-h="24" onclick="loadRange(24)">24h</button>
+  <div class="ac-auto">
+    <span class="sl-l">Auto-off</span>
+    <div class="pills" id="acsleep">
+      <button id="acsl-0" onclick="acPost('/action/ac/sleep?min=0')">off</button>
+      <button id="acsl-60" onclick="acPost('/action/ac/sleep?min=60')">1h</button>
+      <button id="acsl-120" onclick="acPost('/action/ac/sleep?min=120')">2h</button>
+      <button id="acsl-240" onclick="acPost('/action/ac/sleep?min=240')">4h</button>
+      <button id="acsl-480" onclick="acPost('/action/ac/sleep?min=480')">8h</button>
+    </div>
   </div>
+  <details class="ac-more">
+    <summary>Advanced</summary>
+    <div class="ac-row"><span class="sl-l">Mode</span><div class="pills" id="acmode"></div></div>
+    <div class="ac-row"><span class="sl-l">Fan speed</span><div class="pills" id="acfan"></div></div>
+    <div class="ac-row"><span class="sl-l">Air up/down</span><div class="pills" id="acsv"></div></div>
+    <div class="ac-row"><span class="sl-l">Air sideways</span><div class="pills" id="acsh"></div></div>
+    <div class="ac-row"><span class="sl-l">Auto-clean</span><div class="pills">
+      <button id="acac-on" onclick="acPost('/action/ac/feature?auto_clean=on')" title="dries the inside after you turn it off, stops musty smell">on</button>
+      <button id="acac-off" onclick="acPost('/action/ac/feature?auto_clean=off')">off</button></div></div>
+    <div class="ac-row"><span class="sl-l">Energy saving</span><div class="pills">
+      <button id="aces-on" onclick="acPost('/action/ac/feature?energy_saving=on')">on</button>
+      <button id="aces-off" onclick="acPost('/action/ac/feature?energy_saving=off')">off</button></div></div>
+    <div class="ac-row"><span class="sl-l">Max power</span><div class="pills">
+      <button id="acpl-100" onclick="acPost('/action/ac/feature?power_limit=100')">full</button>
+      <button id="acpl-80" onclick="acPost('/action/ac/feature?power_limit=80')">80%</button>
+      <button id="acpl-60" onclick="acPost('/action/ac/feature?power_limit=60')">60%</button>
+      <button id="acpl-40" onclick="acPost('/action/ac/feature?power_limit=40')">40%</button></div></div>
+    <div class="ac-xbtns">
+      <button onclick="acPost('/action/ac/show_power')">&#9889; Show power on AC</button>
+      <button onclick="acPost('/action/ac/resend')">&#8635; Re-send to AC</button>
+    </div>
+  </details>
+  <div class="ac-note" id="acnote"></div>
 </div>
+</div>
+
+<!-- Climate (Temp/Humidity) card removed 2026-10-07: the DHT22 sensor was physically removed
+     and its GPIO32 reused for the IR receiver instead (see config::DHT22_ENABLED, false).
+     Same "UI's use of them was removed" pattern as the Display/Pot toggles below -- the
+     /dht/chart, /dht/chart/range, /dht/chart/request routes and dht22::spawn_chart_cache_refresher
+     stay server-side intact (still useful for past history already logged), only this card and
+     its chart JS (smoothPath/renderChart/tickChartMeta/pointsToEvents/refreshChart/loadRange,
+     previously right below the status-poll handler) were removed from the rendered page. -->
 
 <div class="card">
   <div class="ch"><h2>LEDs</h2></div>
@@ -369,6 +429,42 @@ function ledUpd(c,on){
   document.getElementById('l'+p+'-1').className=on?'act':'';
 }
 function act(u){post(u).then(refresh);}
+var AC={mode:['cool','dry','fan','auto','heat'],fan:['auto','lowest','low','medium','high','max'],
+  sv:['swing','highest','middle','lowest','off'],sh:['auto','off']};
+var ACL={mode:{cool:'Cool',dry:'Dry (dehumidify)',fan:'Fan only',auto:'Auto',heat:'Heat'},
+  fan:{auto:'Auto',lowest:'Quiet',low:'Low',medium:'Medium',high:'High',max:'Max'},
+  sv:{swing:'Sweep',highest:'Up',middle:'Middle',lowest:'Down',off:'Fixed'},sh:{auto:'Sweep',off:'Fixed'}};
+var ACQ={mode:'set?mode=',fan:'set?fan=',sv:'swing_v?pos=',sh:'swing_h?pos='};
+function acPost(u){post(u).then(refresh);}
+function acPills(){
+  Object.keys(AC).forEach(function(k){
+    var el=document.getElementById('ac'+k);
+    AC[k].forEach(function(v){
+      var b=document.createElement('button');b.textContent=(ACL[k]&&ACL[k][v])||v;b.id='ac'+k+'-'+v;
+      b.onclick=function(){acPost('/action/ac/'+ACQ[k]+v);};el.appendChild(b);
+    });
+  });
+}
+function acUpd(a){
+  if(!a)return;
+  setChk('acpwr',a.on);
+  document.getElementById('accard').className='card'+(a.on?' cold':'');
+  document.getElementById('act').textContent=a.temp+'\u00B0';
+  document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode):'Off';
+  var cur={mode:a.mode,fan:a.fan,sv:a.swing_v,sh:a.swing_h};
+  Object.keys(AC).forEach(function(k){AC[k].forEach(function(v){
+    document.getElementById('ac'+k+'-'+v).className=(cur[k]===v)?'act':'';});});
+  document.getElementById('acjet').className=a.jet?'act':'';
+  document.getElementById('acac-on').className=a.auto_clean?'act':'';
+  document.getElementById('acac-off').className=a.auto_clean?'':'act';
+  document.getElementById('aces-on').className=a.energy_saving?'act':'';
+  document.getElementById('aces-off').className=a.energy_saving?'':'act';
+  [100,80,60,40].forEach(function(p){document.getElementById('acpl-'+p).className=(a.power_limit===p)?'act':'';});
+  var m=a.off_in_min;
+  document.getElementById('acnote').textContent=(a.pending?'Sending\u2026 ':'')+
+    (m!==null&&a.on?('Turns off in '+(m>=60?Math.floor(m/60)+'h '+(m%60)+'m':m+'m')):'');
+  ['60','120','240','480','0'].forEach(function(v){document.getElementById('acsl-'+v).className=(v==='0'&&m===null)?'act':'';});
+}
 function refresh(){
   fetch('/status').then(function(r){return r.json()}).then(function(d){
     document.getElementById('dot').className='dot'+(d.wifi?' ok':'');
@@ -387,133 +483,13 @@ function refresh(){
     ledUpd('green',d.led_green);
     ledUpd('red',d.led_red);
     ledUpd('yellow',d.led_yellow);
-    document.getElementById('tempv').textContent=d.dht_temp!==null?d.dht_temp.toFixed(1)+'\u00B0C':'--';
-    document.getElementById('humv').textContent=d.dht_humidity!==null?d.dht_humidity.toFixed(1)+'%':'--';
+    acUpd(d.ac);
   }).catch(function(){document.getElementById('dot').className='dot';});
 }
-// Catmull-Rom-through-cubic-bezier smoothing -- a compact, well-known way to get a smooth
-// TradingView-style curve through a point series without pulling in a charting library.
-function smoothPath(xs,vals,mn,mx){
-  var n=xs.length;
-  function y(i){return 90-((vals[i]-mn)/(mx-mn))*90;}
-  var d='M'+xs[0].toFixed(1)+','+y(0).toFixed(1)+' ';
-  for(var i=0;i<n-1;i++){
-    var i0=i>0?i-1:0, i2=i+1, i3=i+2<n?i+2:i+1;
-    var cp1x=xs[i]+(xs[i2]-xs[i0])/6, cp1y=y(i)+(y(i2)-y(i0))/6;
-    var cp2x=xs[i2]-(xs[i3]-xs[i])/6, cp2y=y(i2)-(y(i3)-y(i))/6;
-    d+='C'+cp1x.toFixed(1)+','+cp1y.toFixed(1)+' '+cp2x.toFixed(1)+','+cp2y.toFixed(1)+' '+xs[i2].toFixed(1)+','+y(i2).toFixed(1)+' ';
-  }
-  return d;
-}
-var lastFetchAt=null;
-function renderChart(events){
-  var pts=events.slice().reverse();
-  var wrap=document.getElementById('climchartwrap');
-  var svg=document.getElementById('climchart');
-  if(pts.length<2){svg.innerHTML='';document.getElementById('chartrange').textContent='not enough data yet';return;}
-  var temps=pts.map(function(e){return e.metadata.temp_c});
-  var hums=pts.map(function(e){return e.metadata.humidity_pct});
-  var tMin=Math.min.apply(null,temps),tMax=Math.max.apply(null,temps);
-  var hMin=Math.min.apply(null,hums),hMax=Math.max.apply(null,hums);
-  if(tMin===tMax){tMin-=1;tMax+=1;}
-  if(hMin===hMax){hMin-=1;hMax+=1;}
-  var n=pts.length;
-  var xs=[];
-  for(var i=0;i<n;i++){xs.push((i/(n-1))*300);}
-  var tPath=smoothPath(xs,temps,tMin,tMax);
-  var hPath=smoothPath(xs,hums,hMin,hMax);
-  var lastX=xs[n-1].toFixed(1);
-  var lastTY=(90-((temps[n-1]-tMin)/(tMax-tMin))*90).toFixed(1);
-  var lastHY=(90-((hums[n-1]-hMin)/(hMax-hMin))*90).toFixed(1);
-  svg.innerHTML=
-    '<defs>'+
-    '<linearGradient id="gT" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f97316" stop-opacity="0.32"/><stop offset="100%" stop-color="#f97316" stop-opacity="0"/></linearGradient>'+
-    '<linearGradient id="gH" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#38bdf8" stop-opacity="0.32"/><stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/></linearGradient>'+
-    '</defs>'+
-    '<path d="'+tPath+'L'+lastX+',90 L0,90 Z" fill="url(#gT)" stroke="none"/>'+
-    '<path d="'+hPath+'L'+lastX+',90 L0,90 Z" fill="url(#gH)" stroke="none"/>'+
-    '<path d="'+tPath+'" fill="none" stroke="#f97316" stroke-width="2" vector-effect="non-scaling-stroke"/>'+
-    '<path d="'+hPath+'" fill="none" stroke="#38bdf8" stroke-width="2" vector-effect="non-scaling-stroke"/>'+
-    '<text x="3" y="9" font-size="7" fill="#f97316" opacity="0.85">'+tMax.toFixed(1)+'</text>'+
-    '<text x="3" y="87" font-size="7" fill="#f97316" opacity="0.85">'+tMin.toFixed(1)+'</text>'+
-    '<text x="297" y="9" font-size="7" fill="#38bdf8" text-anchor="end" opacity="0.85">'+hMax.toFixed(1)+'</text>'+
-    '<text x="297" y="87" font-size="7" fill="#38bdf8" text-anchor="end" opacity="0.85">'+hMin.toFixed(1)+'</text>'+
-    '<circle cx="'+lastX+'" cy="'+lastTY+'" r="3" fill="#f97316" class="pulse-dot"/>'+
-    '<circle cx="'+lastX+'" cy="'+lastHY+'" r="3" fill="#38bdf8" class="pulse-dot"/>';
-  // Restart the fade-in animation on every redraw (a class toggle alone won't retrigger a
-  // CSS animation already applied -- removing then re-adding after a reflow does) so each
-  // refresh reads as a genuine live update, not a static swap.
-  wrap.classList.remove('climchart-wrap');
-  void wrap.offsetWidth;
-  wrap.classList.add('climchart-wrap');
-  function fmt(iso){var d=new Date(iso);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
-  document.getElementById('chartrange').textContent=
-    fmt(pts[0].created_at)+' \u2192 '+fmt(pts[pts.length-1].created_at)+' ('+n+' readings)';
-  lastFetchAt=Date.now();
-}
-var chartMode=0; // 0 = Live, else the preset hours
-function tickChartMeta(){
-  var el=document.getElementById('chartmeta');
-  if(!lastFetchAt){el.textContent='';return;}
-  var secAgo=Math.floor((Date.now()-lastFetchAt)/1000);
-  var txt='updated '+secAgo+'s ago';
-  // Past 30s with no successful re-render means the last few fetch attempts failed silently
-  // (this device's own well-documented occasional WiFi blips) -- "next in 0s" forever would
-  // read as broken/stuck, so say so plainly instead once we're clearly overdue.
-  if(chartMode===0){
-    txt+=secAgo>32?' \u00b7 retrying\u2026':' \u00b7 next in '+Math.max(0,30-secAgo)+'s';
-  }
-  el.textContent=txt;
-}
-setInterval(tickChartMeta,1000);
-// Shared by the default "Live" fetch and the 1h/6h/24h buttons -- both now serve the same
-// bucketed [epoch,temp,hum] point format (2026-08-31: Live moved off its own raw-event
-// endpoint onto this one too, see dht22.rs's own comment for why), converted into the
-// {created_at,metadata} shape renderChart already expects.
-function pointsToEvents(points){
-  return (points||[]).slice().reverse()
-    .filter(function(p){return p[1]!==null&&p[2]!==null})
-    .map(function(p){return {created_at:new Date(p[0]*1000).toISOString(),
-      metadata:{temp_c:p[1],humidity_pct:p[2]}};});
-}
-function refreshChart(){
-  chartMode=0;
-  fetch('/dht/chart').then(function(r){return r.json()}).then(function(d){
-    renderChart(pointsToEvents(d.points));
-  }).catch(function(){});
-}
-var chartAutoTimer=setInterval(refreshChart,30000);
-var rangePoll=null;
-function setRangeActive(h){
-  var btns=document.querySelectorAll('#chartRangeBtns button');
-  for(var i=0;i<btns.length;i++){
-    btns[i].className=(+btns[i].getAttribute('data-h')===h)?'act':'';
-  }
-}
-function loadRange(h){
-  setRangeActive(h);
-  if(rangePoll){clearInterval(rangePoll);rangePoll=null;}
-  if(h===0){
-    if(!chartAutoTimer)chartAutoTimer=setInterval(refreshChart,30000);
-    refreshChart();
-    return;
-  }
-  if(chartAutoTimer){clearInterval(chartAutoTimer);chartAutoTimer=null;}
-  chartMode=h;
-  document.getElementById('chartrange').textContent='loading '+h+'h\u2026';
-  post('/dht/chart/request?hours='+h);
-  function poll(){
-    fetch('/dht/chart/range?hours='+h).then(function(r){return r.json()}).then(function(d){
-      if(d.pending)return;
-      clearInterval(rangePoll);rangePoll=null;
-      renderChart(pointsToEvents(d.points));
-    }).catch(function(){});
-  }
-  rangePoll=setInterval(poll,1000);
-  poll();
-}
-refreshChart();
-slUpd();refresh();setInterval(refresh,3000);
+// Climate chart JS (smoothPath/renderChart/tickChartMeta/pointsToEvents/refreshChart/loadRange/
+// setRangeActive, ~120 lines) removed 2026-10-07 along with the Climate card above -- see that
+// card's own removal comment. The /dht/chart* routes and refresher thread are unaffected.
+acPills();slUpd();refresh();setInterval(refresh,3000);
 </script>
 </body>
 </html>"##;
@@ -874,6 +850,16 @@ fn handle(
             lamp.queue_brightness_temp(tuya_b, tuya_t);
             ok(&mut s, network_lock);
         }
+        // Relative brightness nudge that doesn't require knowing the lamp's current color --
+        // for callers (Jarvis, voice commands, etc.) that only know "brighter"/"dimmer", not
+        // the full current state. See LampHandle::step_brightness's own comment for why this
+        // needed centralizing rather than leaving each caller to track mode locally.
+        ("POST", "/action/lamp/brightness") => {
+            let delta = get_param(query, "delta").unwrap_or(0).clamp(-1000, 1000);
+            lamp.step_brightness(delta);
+            api::report_event("button_press", "info", "brightness nudge (web/api)".to_string(), classify_origin(&peer));
+            ok(&mut s, network_lock);
+        }
         // ── Screen ──────────────────────────────────────────────────────────
         ("POST", "/action/screen") | ("POST", "/action/screen/next") => {
             triggers.screen.store(true, Ordering::Relaxed);
@@ -946,6 +932,73 @@ fn handle(
             if let Ok(mut st) = ui_state.lock() { st.lamp.on = true; st.lamp.known = true; }
             ok(&mut s, network_lock);
         }
+        // ── LG AC (see ac.rs: state changes only, its own thread does the IR send) ──
+        ("GET", "/ac/state") => {
+            let json = crate::ac::state_json();
+            write_response(&mut s, "200 OK", "application/json", json.as_bytes(), network_lock);
+        }
+        ("POST", "/action/ac/on")     => { crate::ac::set_power(true);  ac_event(&peer, "on"); ok(&mut s, network_lock); }
+        ("POST", "/action/ac/off")    => { crate::ac::set_power(false); ac_event(&peer, "off"); ok(&mut s, network_lock); }
+        ("POST", "/action/ac/listen") => {
+            crate::ac::listen(get_param(query, "secs").unwrap_or(120).max(1) as u32);
+            ok(&mut s, network_lock);
+        }
+        ("GET", "/ac/sniff") => {
+            let body = crate::ac::sniffed();
+            write_response(&mut s, "200 OK", "text/plain", body.as_bytes(), network_lock);
+        }
+        ("GET", "/ac/loopback") => {
+            let body = crate::ac::loopback();
+            write_response(&mut s, "200 OK", "text/plain", body.as_bytes(), network_lock);
+        }
+        ("POST", "/action/ac/raw") => {
+            if crate::ac::queue_raw(get_param_str(query, "d").unwrap_or("")) {
+                ok(&mut s, network_lock);
+            } else {
+                write_response(&mut s, "400 Bad Request", "text/plain", b"need d=mark,space,... (us)", network_lock);
+            }
+        }
+        ("POST", "/action/ac/sleep") => {
+            if crate::ac::sleep_in(get_param(query, "min").unwrap_or(0).max(0) as u32) {
+                ok(&mut s, network_lock);
+            } else {
+                write_response(&mut s, "503 Service Unavailable", "text/plain", b"clock not synced yet", network_lock);
+            }
+        }
+        ("POST", "/action/ac/feature") => {
+            let onoff = |k: &str| get_param_str(query, k).map(|v| v == "on");
+            let limit = get_param(query, "power_limit").map(|p| p.clamp(0, 255) as u8);
+            if crate::ac::set_features(onoff("auto_clean"), onoff("energy_saving"), limit) {
+                ok(&mut s, network_lock);
+            } else {
+                write_response(&mut s, "400 Bad Request", "text/plain", b"power_limit must be 100, 80, 60 or 40", network_lock);
+            }
+        }
+        ("POST", "/action/ac/show_power") => { crate::ac::show_power(); ok(&mut s, network_lock); }
+        ("POST", "/action/ac/preset") => {
+            if crate::ac::preset(get_param_str(query, "name").unwrap_or("")) {
+                ok(&mut s, network_lock);
+            } else {
+                write_response(&mut s, "400 Bad Request", "text/plain", b"unknown preset", network_lock);
+            }
+        }
+        ("POST", "/action/ac/resend") => { crate::ac::resend(); ok(&mut s, network_lock); }
+        ("POST", "/action/ac/temp")   => {
+            crate::ac::step_temp(get_param(query, "delta").unwrap_or(0).clamp(-14, 14));
+            ok(&mut s, network_lock);
+        }
+        ("POST", "/action/ac/set") => {
+            if crate::ac::set(get_param_str(query, "mode"), get_param(query, "temp"), get_param_str(query, "fan")) {
+                ok(&mut s, network_lock);
+            } else {
+                write_response(&mut s, "400 Bad Request", "text/plain", b"bad mode/fan", network_lock);
+            }
+        }
+        ("POST", "/action/ac/swing_v") | ("POST", "/action/ac/swing_h") => {
+            let pos = get_param_str(query, "pos").unwrap_or("");
+            let okay = if path.ends_with("_v") { crate::ac::set_swing_v(pos) } else { crate::ac::set_swing_h(pos) };
+            if okay { ok(&mut s, network_lock); } else { write_response(&mut s, "400 Bad Request", "text/plain", b"bad pos", network_lock); }
+        }
         // ── LEDs ────────────────────────────────────────────────────────────
         ("POST", "/action/led/green/on")  => { leds.set_green(true);  ok(&mut s, network_lock); }
         ("POST", "/action/led/green/off") => { leds.set_green(false); ok(&mut s, network_lock); }
@@ -960,6 +1013,10 @@ fn handle(
         }
         _ => { write_response(&mut s, "404 Not Found", "text/plain", b"not found", network_lock); }
     }
+}
+
+fn ac_event(peer: &str, what: &str) {
+    api::report_event("button_press", "info", std::format!("AC {what} (web)"), classify_origin(peer));
 }
 
 fn build_status(
@@ -998,7 +1055,7 @@ fn build_status(
             r#""led_green":{lg},"led_red":{lr},"led_yellow":{lyl},"#,
             r#""prices":{{"btc":{btc},"btc_chg":{bc},"sol":{sol},"sol_chg":{sc},"#,
             r#""gold":{gold},"gold_chg":{gc},"oil":{oil},"oil_chg":{oc},"#,
-            r#""usd_brl":{brl},"usd_brl_chg":{brc}}}}}"#
+            r#""usd_brl":{brl},"usd_brl_chg":{brc}}},"ac":{ac}}}"#
         ),
         scr  = st.screen.name().trim(),
         si   = st.screen as u8,
@@ -1029,6 +1086,7 @@ fn build_status(
         oc   = d.chg_oil_pct,
         brl  = d.price_usd_brl,
         brc  = d.chg_usd_brl_pct,
+        ac   = crate::ac::state_json(),
     )
 }
 
