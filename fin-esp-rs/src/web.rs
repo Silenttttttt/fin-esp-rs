@@ -174,6 +174,12 @@ button:active{opacity:.72;transform:scale(.96)}
 .ac-row{display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.4rem}
 .ac-row .sl-l{width:5.2rem;padding-top:.3rem;flex-shrink:0}
 .card.cold{box-shadow:0 0 50px -14px rgba(56,189,248,.35),inset 0 1px 0 rgba(255,255,255,.04)}
+.ac-st{margin-left:auto;margin-right:.3rem;padding:.15rem .6rem;border-radius:999px;font-size:.7rem;font-weight:700;
+  letter-spacing:.08em;background:#1a1a30;color:var(--dim);border:1px solid var(--bd)}
+.ac-st+.sw{margin-left:0}
+.ac-st.on{background:rgba(34,197,94,.14);color:var(--up);border-color:rgba(34,197,94,.45);box-shadow:0 0 10px rgba(34,197,94,.25)}
+.card.acoff .ac-t{color:var(--dim);font-size:2.3rem;letter-spacing:.06em}
+.card.acoff .ac-scenes,.card.acoff .ac-auto,.card.acoff .ac-temp .ac-tbtn{opacity:.5}
 .ac-note{font-size:.68rem;color:var(--dim);margin-top:.6rem;text-align:center}
 .ac-xbtns{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.5rem}
 .ac-xbtns button{font-size:.74rem}
@@ -233,6 +239,7 @@ button:active{opacity:.72;transform:scale(.96)}
 <div class="card" id="accard">
   <div class="ch">
     <h2>Air Conditioner</h2>
+    <span class="ac-st" id="acst">--</span>
     <label class="sw">
       <input type="checkbox" id="acpwr" onchange="if(!_upd)post('/action/ac/'+(this.checked?'on':'off')).then(refresh)">
       <span class="sw-t"></span><span class="sw-k"></span>
@@ -471,9 +478,10 @@ function acPills(){
 function acUpd(a){
   if(!a)return;
   setChk('acpwr',a.on);
-  document.getElementById('accard').className='card'+(a.on?' cold':'');
-  document.getElementById('act').textContent=a.temp+'\u00B0';
-  document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode):'Off';
+  document.getElementById('accard').className='card'+(a.on?' cold':' acoff');
+  var st=document.getElementById('acst');st.textContent=a.on?'ON':'OFF';st.className='ac-st'+(a.on?' on':'');
+  document.getElementById('act').textContent=a.on?a.temp+'\u00B0':'OFF';
+  document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode):'set to '+a.temp+'\u00B0';
   var cur={mode:a.mode,fan:a.fan,sv:a.swing_v,sh:a.swing_h};
   Object.keys(AC).forEach(function(k){AC[k].forEach(function(v){
     document.getElementById('ac'+k+'-'+v).className=(cur[k]===v)?'act':'';});});

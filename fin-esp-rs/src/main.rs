@@ -757,6 +757,11 @@ fn main() {
     let mut media_raw_last      = true;
     let mut media_raw_since_ms: u64 = 0;
     let mut media_stable_state  = true;
+    // 2026-10-27: even with the stable-state debounce, device-events logged one press as
+    // "AC on" then "AC off" 255 ms apart (the switch released and re-closed for >100 ms),
+    // which cancels itself out and looks like the button did nothing. Nobody means on-then-off
+    // within a second and a half, so further presses are ignored for AC_BTN_LOCKOUT_MS.
+    let mut media_last_press_ms: u64 = 0;
     // screen_forced_off declared earlier (loaded from NVS)
 
     let mut last_debounce_warm_ms:   u64 = 0;
@@ -1099,7 +1104,12 @@ fn main() {
         let mut phys_media = false;
         if media_raw != media_stable_state && now - media_raw_since_ms >= config::DEBOUNCE_MS {
             if media_stable_state && !media_raw {
-                phys_media = true; // confirmed falling edge: button actually pressed
+                if media_last_press_ms == 0 || now - media_last_press_ms >= config::AC_BTN_LOCKOUT_MS {
+                    phys_media = true; // confirmed falling edge: button actually pressed
+                    media_last_press_ms = now;
+                } else {
+                    info!("[btn] AC press ignored ({} ms after the last one)", now - media_last_press_ms);
+                }
             }
             media_stable_state = media_raw;
         }
