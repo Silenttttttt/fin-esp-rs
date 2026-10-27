@@ -212,6 +212,10 @@ pub const DHT22_ENABLED: bool = false;
 // real bench-test board) instead of one. Disabled until real hardware is actually wired here;
 // the bench-test board (rust_bench_test, a separate project) is the one with a real mic today.
 pub const FIN_ESP_MIC_ENABLED: bool = false;
+
+/// Fin-ESP acts as the LG AC's local cloud (see ac_cloud.rs). Disabled until each stage is proven
+/// stable — it adds a TLS handshake to a memory-tight, OOM-prone board.
+pub const AC_CLOUD_ENABLED: bool = false;
 // Crypto/gold/oil/USD-BRL price fetching - disabled per direct request 2026-08-30
 // ("we're not even using any of that"), same "kept, not removed" pattern as the flags above so
 // it can come back with one flip if that changes. When false, main.rs never spawns the finFetch

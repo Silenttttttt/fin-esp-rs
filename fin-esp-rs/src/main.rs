@@ -1,4 +1,5 @@
 mod ac;
+mod ac_cloud;
 mod api;
 mod cache;
 mod cgram;
@@ -455,6 +456,7 @@ fn main() {
     // the safe direction; the onboard blue LED on GPIO2 flickers with each send) -- Fin-ESP is the AC's only controller, see
     // ac.rs's header. Loads persisted state, never transmits on boot.
     ac::spawn(peripherals.rmt.channel0, peripherals.pins.gpio2, persist.clone());
+    if config::AC_CLOUD_ENABLED { ac_cloud::spawn(); }
 
     let auto_rotate = Arc::new(AtomicBool::new(true));
 

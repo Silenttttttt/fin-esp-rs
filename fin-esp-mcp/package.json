@@ -6,6 +6,7 @@
   "private": true,
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "mqtt": "^5.16.1",
     "zod": "^4.5.1"
   }
 }

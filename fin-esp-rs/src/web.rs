@@ -177,6 +177,11 @@ button:active{opacity:.72;transform:scale(.96)}
 .ac-note{font-size:.68rem;color:var(--dim);margin-top:.6rem;text-align:center}
 .ac-xbtns{display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.5rem}
 .ac-xbtns button{font-size:.74rem}
+.ac-live{display:none;flex-wrap:wrap;gap:.3rem .8rem;margin:.3rem 0 .2rem;padding:.5rem .6rem;
+  background:var(--s2);border:1px solid var(--bd);border-radius:.6rem;font-size:.72rem}
+.ac-live.on{display:flex}
+.ac-live b{color:var(--txt);font-weight:600;font-variant-numeric:tabular-nums}
+.ac-live .lbl{color:var(--dim)}
 .ac-more{margin-top:.7rem;border-top:1px solid var(--bd);padding-top:.3rem}
 .ac-more summary{font-size:.75rem;color:var(--dim);cursor:pointer;padding:.45rem 0;list-style-position:inside}
 .ac-more[open] summary{margin-bottom:.5rem}
@@ -238,6 +243,7 @@ button:active{opacity:.72;transform:scale(.96)}
     <div class="ac-tc"><span class="ac-t" id="act">--</span><span class="ac-mode" id="acmodelbl"></span></div>
     <button class="ac-tbtn" onclick="acPost('/action/ac/temp?delta=1')">+</button>
   </div>
+  <div class="ac-live" id="aclive"></div>
   <div class="ac-scenes">
     <button id="acjet" onclick="acPost('/action/ac/preset?name=jet')"><b>&#10052;&#65039;</b>Cool fast</button>
     <button onclick="acPost('/action/ac/preset?name=comfort')"><b>&#128522;</b>Comfort</button>
@@ -436,6 +442,24 @@ var ACL={mode:{cool:'Cool',dry:'Dry (dehumidify)',fan:'Fan only',auto:'Auto',hea
   sv:{swing:'Sweep',highest:'Up',middle:'Middle',lowest:'Down',off:'Fixed'},sh:{auto:'Sweep',off:'Fixed'}};
 var ACQ={mode:'set?mode=',fan:'set?fan=',sv:'swing_v?pos=',sh:'swing_h?pos='};
 function acPost(u){post(u).then(refresh);}
+var AC_BRIDGE="http://192.168.1.105:7319/";
+function acLive(){
+  fetch(AC_BRIDGE,{mode:'cors'}).then(function(r){return r.json()}).then(function(a){
+    var el=document.getElementById('aclive');
+    if(!a||!a.available){el.className='ac-live';return;}
+    function row(l,v){return v===null||v===undefined||v===''?'':'<span><span class="lbl">'+l+'</span> <b>'+v+'</b></span>';}
+    el.innerHTML=
+      row('Room',a.room_temp_c!=null?a.room_temp_c+'\u00B0':'')+
+      row('Outside',a.outdoor_temp_c!=null?a.outdoor_temp_c+'\u00B0':'')+
+      row('Coil',a.outdoor_coil_c!=null?a.outdoor_coil_c+'\u00B0':'')+
+      row('State',a.running)+
+      row('Power',a.power_draw!=null?a.power_draw+'W':'')+
+      row('Fan',a.fan_rpm?a.fan_rpm+'rpm':'')+
+      row('EEV',a.eev)+
+      row('Err',a.error_code&&a.error_code!=='0'?a.error_code:'');
+    el.className='ac-live on';
+  }).catch(function(){document.getElementById('aclive').className='ac-live';});
+}
 function acPills(){
   Object.keys(AC).forEach(function(k){
     var el=document.getElementById('ac'+k);
@@ -484,6 +508,7 @@ function refresh(){
     ledUpd('red',d.led_red);
     ledUpd('yellow',d.led_yellow);
     acUpd(d.ac);
+    acLive();
   }).catch(function(){document.getElementById('dot').className='dot';});
 }
 // Climate chart JS (smoothPath/renderChart/tickChartMeta/pointsToEvents/refreshChart/loadRange/
@@ -1055,7 +1080,7 @@ fn build_status(
             r#""led_green":{lg},"led_red":{lr},"led_yellow":{lyl},"#,
             r#""prices":{{"btc":{btc},"btc_chg":{bc},"sol":{sol},"sol_chg":{sc},"#,
             r#""gold":{gold},"gold_chg":{gc},"oil":{oil},"oil_chg":{oc},"#,
-            r#""usd_brl":{brl},"usd_brl_chg":{brc}}},"ac":{ac}}}"#
+            r#""usd_brl":{brl},"usd_brl_chg":{brc}}},"ac":{ac},"mem":{{"free":{hf},"largest_block":{hb},"min_free":{hm},"total":{ht}}}}}"#
         ),
         scr  = st.screen.name().trim(),
         si   = st.screen as u8,
@@ -1087,6 +1112,10 @@ fn build_status(
         brl  = d.price_usd_brl,
         brc  = d.chg_usd_brl_pct,
         ac   = crate::ac::state_json(),
+        hf   = unsafe { esp_idf_sys::esp_get_free_heap_size() },
+        hb   = unsafe { esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT) },
+        hm   = unsafe { esp_idf_sys::esp_get_minimum_free_heap_size() },
+        ht   = unsafe { esp_idf_sys::heap_caps_get_total_size(esp_idf_sys::MALLOC_CAP_8BIT) },
     )
 }
 

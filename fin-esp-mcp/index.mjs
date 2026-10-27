@@ -15,6 +15,7 @@
  */
 
 import { z } from "zod";
+import mqtt from "mqtt";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
@@ -286,6 +287,69 @@ server.registerTool(
     inputSchema: {},
   },
   async () => text(await post("/action/ac/resend")),
+);
+
+// ── LG AC real state via rethink (READ-ONLY, over the local MQTT broker) ─────────────────────
+// rethink (the local fake-ThinQ-cloud server) decodes the AC's real two-way state and publishes it
+// to a localhost MQTT broker. This reads those retained topics on demand. It NEVER writes to the AC
+// or to MQTT. If rethink/MQTT isn't running, it returns a clear "unavailable" note.
+const RETHINK_MQTT = process.env.RETHINK_MQTT_URL ?? "mqtt://127.0.0.1:1883";
+
+function readRethinkState(timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let client;
+    const topics = {};
+    const done = (err) => {
+      try { client && client.end(true); } catch {}
+      resolve({ err, topics });
+    };
+    try {
+      client = mqtt.connect(RETHINK_MQTT, { connectTimeout: timeoutMs, reconnectPeriod: 0 });
+    } catch (e) { return done(String(e)); }
+    client.on("error", (e) => done(String(e.message || e)));
+    client.on("connect", () => client.subscribe("rethink/#", (e) => e && done(String(e))));
+    client.on("message", (t, p) => { topics[t] = p.toString(); });
+    // retained messages arrive right after subscribe; collect briefly then finish
+    setTimeout(() => done(null), Math.min(timeoutMs, 1200));
+  });
+}
+
+server.registerTool(
+  "lg_ac_live",
+  {
+    title: "AC real state (two-way, via rethink)",
+    description:
+      "The air conditioner's REAL state and sensors, read from its own WiFi reporting through the local rethink " +
+      "server: room temperature, outdoor temperature, actual on/off & mode, live power draw, fan, swing, timers, " +
+      "filter, error code, etc. This is genuine readback from the AC (unlike the IR tools, which only track what " +
+      "Fin-ESP last sent). Read-only; nothing is sent to the AC. Returns a note if rethink isn't running.",
+    inputSchema: {},
+    annotations: readOnly,
+  },
+  async () => {
+    const { err, topics } = await readRethinkState();
+    if (err || Object.keys(topics).length === 0)
+      return text(JSON.stringify({ available: false, note: "rethink/MQTT not reachable — IR tools still work", error: err || "no data" }));
+    const dev = Object.keys(topics).map((t) => t.split("/")[1]).find((x) => /^[0-9a-f]{8}-[0-9a-f-]+$/.test(x));
+    const g = (k) => topics[`rethink/${dev}/${k}`] ?? topics[`rethink/${dev}/${k}-`];
+    const num = (k) => { const v = g(k); return v == null ? null : (isNaN(+v) ? v : +v); };
+    const state = {
+      available: true, device: dev,
+      on: g("climate-mode") && g("climate-mode") !== "off",
+      mode: g("climate-mode"), running: g("climate-action"),
+      target_temp_c: num("climate-temperature"),
+      room_temp_c: num("climate-current_temperature"),
+      outdoor_temp_c: num("oduairtemp"), outdoor_coil_c: num("oduhextemp"),
+      fan: g("climate-fan_mode"), swing: g("climate-swing_mode"),
+      power_draw: num("energy_current"), capacity_kw: num("capacity"),
+      eev: num("eev"), outdoor_fan_rpm: num("fanrpm"),
+      jet: g("jet"), soft_air: g("softair"), energy_limit: g("energylimit"),
+      auto_clean: g("autodrysetting"), beep: g("beep"),
+      sleep_timer: num("sleeptimer"), off_timer: num("stoptimer"), on_timer: num("starttimer"),
+      error_code: g("error"), filter_used_h: num("filterused"), filter_life_h: num("filterlife"),
+    };
+    return text(JSON.stringify(state, null, 2));
+  },
 );
 
 await server.connect(new StdioServerTransport());
