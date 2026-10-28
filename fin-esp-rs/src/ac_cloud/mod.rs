@@ -632,6 +632,7 @@ pub fn write_climate(elems: &[(u16, u32)]) -> bool {
             0x1f9 => matches!(v, 0 | 1 | 2 | 4 | 6),
             0x1fa => matches!(v, 2..=6 | 8),
             0x1fe => (32..=60).contains(&v),
+            0x321 => matches!(v, 0..=6 | 100), // vertical vane: fixed, 1-6 top..bottom, swing
             _ => false,
         };
         if !ok { warn!("[ac_cloud] refused climate write {t:#x}={v}"); return false; }
@@ -654,6 +655,8 @@ pub struct Readback {
     pub swing_h: Option<u32>,
     pub auto_dry: Option<u32>,
     pub power_limit: Option<u32>,
+    /// Counts MQTT sessions since boot: a change means the AC (re)connected.
+    pub session: u32,
 }
 
 /// A TLV frame must have arrived this recently for the readback to count as live. The AC pushes
@@ -683,6 +686,7 @@ pub fn readback() -> Option<Readback> {
             swing_h: sh.regs.get(0x322),
             auto_dry: sh.regs.get(0x20e),
             power_limit: sh.regs.get(0x20d),
+            session: st.mqtt_sessions,
         });
     });
     out

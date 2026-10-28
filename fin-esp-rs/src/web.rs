@@ -446,7 +446,35 @@ var ACL={mode:{cool:'Cool',dry:'Dry (dehumidify)',fan:'Fan only',auto:'Auto',hea
   sv:{swing:'Sweep',highest:'Up',middle:'Middle',lowest:'Down',off:'Fixed'},sh:{auto:'Sweep',off:'Fixed'}};
 var ACQ={mode:'set?mode=',fan:'set?fan=',sv:'swing_v?pos=',sh:'swing_h?pos='};
 var acOn=false;
-function acPost(u){post(u).then(refresh);}
+// 2026-10-27 (Muni: "the web page be fast so it shows the result, instead of waiting"): every AC
+// click updates the card instantly from what it will do (acPatch), then re-reads Fin-ESP a few
+// times quickly so the AC's own confirmation (~1 s) shows without waiting for the 3 s poll.
+var acLast=null,acClickAt=0;
+function acPatch(u,a){
+  var q={},i=u.indexOf('?'),p=i<0?u:u.slice(0,i);
+  if(i>=0)u.slice(i+1).split('&').forEach(function(kv){var s=kv.split('=');q[s[0]]=decodeURIComponent(s[1]||'');});
+  var n=JSON.parse(JSON.stringify(a));function on(){n.on=true;}
+  switch(p){
+  case '/action/ac/toggle':n.on=!a.on;break;
+  case '/action/ac/on':n.on=true;break;
+  case '/action/ac/off':n.on=false;break;
+  case '/action/ac/temp':n.temp=Math.max(16,Math.min(30,a.temp+(+q.delta||0)));on();break;
+  case '/action/ac/set':if(q.mode)n.mode=q.mode;if(q.fan)n.fan=q.fan;if(q.temp)n.temp=+q.temp;on();break;
+  case '/action/ac/swing_v':n.swing_v=q.pos;on();break;
+  case '/action/ac/swing_h':n.swing_h=q.pos;on();break;
+  case '/action/ac/feature':if(q.auto_clean)n.auto_clean=q.auto_clean==='on';if(q.energy_saving)n.energy_saving=q.energy_saving==='on';if(q.power_limit)n.power_limit=+q.power_limit;on();break;
+  case '/action/ac/sleep':var m=+q.min||0;n.off_in_min=m?m:null;if(m)on();break;
+  case '/action/ac/preset':var P={comfort:['cool',21,'auto'],night:['cool',24,'lowest'],dry:['dry',23,'auto']}[q.name];
+    if(P){n.mode=P[0];n.temp=P[1];n.fan=P[2];}if(q.name==='jet')n.jet=true;on();break;
+  }
+  n.verify='waiting';n.in_sync=false;
+  return n;
+}
+function acPost(u){
+  if(acLast){acLast=acPatch(u,acLast);acUpd(acLast);}
+  acClickAt=Date.now();
+  post(u).then(function(){refresh();setTimeout(refresh,700);setTimeout(refresh,1500);setTimeout(refresh,2800);});
+}
 function acLive(){
   fetch('/ac/cloud').then(function(r){return r.json()}).then(function(a){
     var el=document.getElementById('aclive');
@@ -500,8 +528,12 @@ function acUpd(a){
     (m!==null&&a.on?('Turns off in '+(m>=60?Math.floor(m/60)+'h '+(m%60)+'m':m+'m')):'');
   ['60','120','240','480','0'].forEach(function(v){document.getElementById('acsl-'+v).className=(v==='0'&&m===null)?'act':'';});
 }
+var bootId=null;
 function refresh(){
+  var t0=Date.now();
   fetch('/status').then(function(r){return r.json()}).then(function(d){
+    // Fin-ESP restarted (new firmware or reboot): reload so the page itself is never a stale build.
+    if(bootId===null)bootId=d.boot;else if(d.boot!==bootId){location.reload();return;}
     document.getElementById('dot').className='dot'+(d.wifi?' ok':'');
     document.getElementById('ft').textContent=d.fetching?'...':'';
     if(d.weather_temp!==null&&d.weather_code!==null){
@@ -518,7 +550,8 @@ function refresh(){
     ledUpd('green',d.led_green);
     ledUpd('red',d.led_red);
     ledUpd('yellow',d.led_yellow);
-    acUpd(d.ac);
+    // A poll that left before the latest click carries the old state: keep the instant one.
+    if(t0>=acClickAt){acLast=d.ac;acUpd(d.ac);}
     acLive();
   }).catch(function(){document.getElementById('dot').className='dot';});
 }
@@ -1123,7 +1156,7 @@ fn build_status(
 
     std::format!(
         concat!(
-            r#"{{"screen":"{scr}","screen_idx":{si},"lamp_on":{lon},"lamp_known":{lk},"#,
+            r#"{{"boot":{boot},"screen":"{scr}","screen_idx":{si},"lamp_on":{lon},"lamp_known":{lk},"#,
             r#""lamp_brightness":{lb},"lamp_temp":{lt},"display_on":{don},"pot_on":{pot},"#,
             r#""volume":{vol},"fetching":{fet},"wifi":{wifi},"auto_rotate":{ar},"#,
             r#""weather_temp":{wt},"weather_code":{wc},"#,
@@ -1133,6 +1166,7 @@ fn build_status(
             r#""gold":{gold},"gold_chg":{gc},"oil":{oil},"oil_chg":{oc},"#,
             r#""usd_brl":{brl},"usd_brl_chg":{brc}}},"ac":{ac},"mem":{{"free":{hf},"largest_block":{hb},"min_free":{hm},"total":{ht}}}}}"#
         ),
+        boot = boot_id(),
         scr  = st.screen.name().trim(),
         si   = st.screen as u8,
         lon  = st.lamp.on,
@@ -1204,4 +1238,11 @@ pub fn spawn(
             }
         })
         .ok();
+}
+
+/// Random per boot, in /status: an open dashboard reloads itself when it changes, so a page
+/// loaded before an OTA flash never keeps showing the old build's layout.
+fn boot_id() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { esp_idf_sys::esp_random() } & 0x7fff_ffff)
 }

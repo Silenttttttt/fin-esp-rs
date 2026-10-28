@@ -111,7 +111,9 @@ pub fn txcfg_json() -> String {
 /// through the GPIO matrix -- same edges, same instant, never opposing -- so their currents add.
 /// No extra parts: just a jumper from each pin to S. Unjumpered pins simply idle low.
 const EXTRA_LED_PINS: [i32; 2] = [4, 25];
-const SETTLE_MS: u64 = 300;
+// 2026-10-27: 300 -> 150 ms (Muni: "can it be quicker"). Still coalesces a burst of +/- taps into one
+// write; over WiFi each write is confirmed by the AC ~1 s later regardless.
+const SETTLE_MS: u64 = 150;
 
 static POWER: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -196,8 +198,15 @@ fn main_frame() -> u32 {
 }
 
 fn mark_main() {
-    LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
+    touch();
     PENDING_MAIN.store(true, Ordering::Relaxed);
+}
+
+/// A local change: holds off adopting the AC's report for ADOPT_QUIET_MS, and marks the state as
+/// real (worth restoring when the AC reconnects).
+fn touch() {
+    LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
+    HAVE_STATE.store(true, Ordering::Relaxed);
 }
 
 // ── Closed loop: verify every main frame against the AC's own readback ──────────────────────
@@ -264,8 +273,9 @@ fn mode_from_tlv(t: u32) -> Option<u8> {
 }
 /// TLV fan code for each FANS entry (same order: lowest, low, medium, high, max, auto).
 const FAN_TLV: [u32; 6] = [2, 3, 4, 5, 6, 8];
-/// Only cool and heat hold a user setpoint; in dry/fan/auto LG ignores or overrides it.
-fn temp_applies(mode_idx: u8) -> bool { mode_idx == 0 || mode_idx == 4 }
+/// Cool, heat and auto hold a user setpoint (auto confirmed live 2026-10-27: the AC reported
+/// 22 -> 25 in auto over WiFi); dry and fan-only ignore it.
+fn temp_applies(mode_idx: u8) -> bool { mode_idx == 0 || mode_idx == 3 || mode_idx == 4 }
 
 /// Does the AC's report match Fin-ESP's power/mode/setpoint?
 fn matches(rb: &crate::ac_cloud::Readback) -> bool {
@@ -302,6 +312,33 @@ fn closed_loop(persist: &Persist) {
     if PENDING_MAIN.load(Ordering::Relaxed) { return; } // a newer change goes out (and is verified) first
     let rb = crate::ac_cloud::readback();
     let now = now_ms();
+    if let Some(r) = &rb {
+        if r.session != LAST_SESSION.load(Ordering::Relaxed) {
+            LAST_SESSION.store(r.session, Ordering::Relaxed);
+            AC_SEEN.store(if r.power { SEEN_ON } else { SEEN_OFF }, Ordering::Relaxed);
+            if HAVE_STATE.load(Ordering::Relaxed) {
+                restore_to_ac(r);
+                return;
+            }
+        }
+        // The AC just came on (from Fin-ESP, the LG remote, anything): once it has settled, put
+        // back the saved airflow/settings in case it came back with others.
+        let seen = AC_SEEN.swap(if r.power { SEEN_ON } else { SEEN_OFF }, Ordering::Relaxed);
+        if r.power && seen == SEEN_OFF {
+            REASSERT_AT_MS.store(now.wrapping_add(REASSERT_DELAY_MS).max(1), Ordering::Relaxed);
+        }
+        let at = REASSERT_AT_MS.load(Ordering::Relaxed);
+        if at != 0 && r.power && VERIFY.load(Ordering::Relaxed) != V_WAITING && now.wrapping_sub(at) < u32::MAX / 2 {
+            REASSERT_AT_MS.store(0, Ordering::Relaxed);
+            let mut what = String::new();
+            restore_extras(r, &mut what);
+            if !what.is_empty() {
+                touch();
+                info!("[ac] AC came on: re-applying saved{}", what);
+            }
+            return;
+        }
+    }
     if VERIFY.load(Ordering::Relaxed) == V_WAITING {
         let waited = now.wrapping_sub(VERIFY_SINCE_MS.load(Ordering::Relaxed));
         let Some(rb) = rb else {
@@ -319,7 +356,7 @@ fn closed_loop(persist: &Persist) {
         if waited < VERIFY_WAIT_MS { return; }
         let sends = VERIFY_SENDS.load(Ordering::Relaxed);
         if sends < VERIFY_MAX_SENDS {
-            warn!("[ac] AC still reports power={} mode={} target={:?} after {} send {sends}: re-sending over IR",
+            warn!("[ac] AC still reports power={} mode={} target={:?} after {} send {sends}: re-sending",
                 rb.power, rb.mode, rb.target_half, if PATH.load(Ordering::Relaxed) == PATH_WIFI { "WiFi" } else { "IR" });
             RETRY_MAIN.store(true, Ordering::Relaxed);
             // Back-date so the sender doesn't wait SETTLE_MS for a retry.
@@ -341,12 +378,62 @@ fn closed_loop(persist: &Persist) {
     adopt_extras(&rb, persist);
 }
 
+const SEEN_UNKNOWN: u8 = 0;
+const SEEN_OFF: u8 = 1;
+const SEEN_ON: u8 = 2;
+/// The AC's power as last seen in its own report.
+static AC_SEEN: AtomicU8 = AtomicU8::new(SEEN_UNKNOWN);
+/// When to re-apply saved settings after the AC came on (0 = nothing scheduled).
+static REASSERT_AT_MS: AtomicU32 = AtomicU32::new(0);
+/// Gives the AC time to report its post-power-on airflow/settings before comparing.
+const REASSERT_DELAY_MS: u32 = 4_000;
+/// MQTT session whose first readback has been handled (see restore_to_ac).
+static LAST_SESSION: AtomicU32 = AtomicU32::new(0);
+/// Fin-ESP has a real saved or user-set state (persisted at boot, or any change since).
+static HAVE_STATE: AtomicBool = AtomicBool::new(false);
+
+/// 2026-10-27 (Muni: "it doesnt keep the states ... on ac restart or esp restart"): when the AC
+/// (re)connects -- after a Fin-ESP reboot, an AC power cut, or a dropped link -- Fin-ESP's saved
+/// state wins and is pushed back to the AC, instead of adopting whatever the AC came back with.
+/// (Seen live 20:58: Fin-ESP rebooted, presses during the ~60 s without WiFi went out over IR,
+/// the AC came on at 24 / lowest fan, and the old reconnect logic adopted that over the saved
+/// 25 / auto.) Within one session, changes made on the AC itself (LG remote) are still adopted.
+fn restore_to_ac(rb: &crate::ac_cloud::Readback) {
+    let mut what = String::new();
+    if !matches(rb) {
+        mark_main();
+        what.push_str(" main");
+    }
+    restore_extras(rb, &mut what);
+    touch();
+    if what.is_empty() {
+        info!("[ac] AC connected (session {}): already matches the saved state", rb.session);
+    } else {
+        info!("[ac] AC connected (session {}): restoring saved state ({}): {}", rb.session, what.trim(), state_json());
+    }
+}
+
+/// Re-sends each airflow/AC setting whose saved value differs from what the AC reports. Energy
+/// saving isn't reported by this unit, so it's re-sent whenever it's saved as on.
+fn restore_extras(rb: &crate::ac_cloud::Readback, what: &mut String) {
+    let sv = match rb.swing_v { Some(0) => Some(0u8), Some(100) => Some(1), Some(p @ 1..=6) => Some(p as u8 + 1), _ => None };
+    if sv.is_some_and(|i| i != SWING_V_IDX.load(Ordering::Relaxed)) { PENDING_SWING_V.store(true, Ordering::Relaxed); what.push_str(" swing_v"); }
+    let sh = match rb.swing_h { Some(0) => Some(0u8), Some(100) => Some(1), _ => None };
+    if sh.is_some_and(|i| i != SWING_H_IDX.load(Ordering::Relaxed)) { PENDING_SWING_H.store(true, Ordering::Relaxed); what.push_str(" swing_h"); }
+    let ad = match rb.auto_dry { Some(0) => Some(false), Some(255) => Some(true), _ => None };
+    if ad.is_some_and(|v| v != AUTO_CLEAN.load(Ordering::Relaxed)) { PENDING_AUTO_CLEAN.store(true, Ordering::Relaxed); what.push_str(" auto_clean"); }
+    let pl = rb.power_limit.map(|p| if p == 0 { 100 } else { p as u8 }).and_then(|p| POWER_LIMITS.iter().position(|(x, _)| *x == p));
+    if pl.is_some_and(|i| i as u8 != POWER_LIMIT.load(Ordering::Relaxed)) { PENDING_POWER_LIMIT.store(true, Ordering::Relaxed); what.push_str(" power_limit"); }
+    if ENERGY_SAVING.load(Ordering::Relaxed) { PENDING_ENERGY_SAVING.store(true, Ordering::Relaxed); what.push_str(" energy_saving"); }
+}
+
 /// 2026-10-27 (Muni: "these dont seem to match"): swing, auto-clean and max power used to show only
 /// what Fin-ESP last sent over IR, unconfirmed. The AC reports them over WiFi (rethink
 /// RAC_056905_WW): 0x321 vertical vane (0 fixed, 100 swing, 1-6 top..bottom), 0x322 horizontal
 /// (0 fixed, 100 swing), 0x20e auto-dry setting (0/255), 0x20d power limit % (0 = no limit).
 /// Each is adopted only while nothing for it is still waiting to be sent.
 fn adopt_extras(rb: &crate::ac_cloud::Readback, persist: &Persist) {
+    if !rb.power || REASSERT_AT_MS.load(Ordering::Relaxed) != 0 { return; } // saved settings win while off / until re-applied
     let before = pack();
     if !PENDING_SWING_V.load(Ordering::Relaxed) {
         let idx = match rb.swing_v { Some(0) => Some(0), Some(100) => Some(1), Some(p @ 1..=6) => Some(p as u8 + 1), _ => None };
@@ -470,14 +557,14 @@ pub fn step_temp(delta: i32) {
 
 pub fn set_swing_v(name: &str) -> bool {
     match SWING_V.iter().position(|(n, _)| *n == name) {
-        Some(i) => { SWING_V_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_V.store(true, Ordering::Relaxed); power_on_if_off(); true }
+        Some(i) => { SWING_V_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_V.store(true, Ordering::Relaxed); touch(); power_on_if_off(); true }
         None => false,
     }
 }
 
 pub fn set_swing_h(name: &str) -> bool {
     match SWING_H.iter().position(|(n, _)| *n == name) {
-        Some(i) => { SWING_H_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_H.store(true, Ordering::Relaxed); power_on_if_off(); true }
+        Some(i) => { SWING_H_IDX.store(i as u8, Ordering::Relaxed); PENDING_SWING_H.store(true, Ordering::Relaxed); touch(); power_on_if_off(); true }
         None => false,
     }
 }
@@ -507,7 +594,7 @@ pub fn set_features(auto_clean: Option<bool>, energy_saving: Option<bool>, power
     if let Some(v) = auto_clean { AUTO_CLEAN.store(v, Ordering::Relaxed); PENDING_AUTO_CLEAN.store(true, Ordering::Relaxed); }
     if let Some(v) = energy_saving { ENERGY_SAVING.store(v, Ordering::Relaxed); PENDING_ENERGY_SAVING.store(true, Ordering::Relaxed); }
     if let Some(i) = limit_idx { POWER_LIMIT.store(i, Ordering::Relaxed); PENDING_POWER_LIMIT.store(true, Ordering::Relaxed); }
-    LAST_CHANGE_MS.store(now_ms(), Ordering::Relaxed);
+    touch();
     power_on_if_off();
     true
 }
@@ -807,6 +894,7 @@ fn build_raw_signal(ticks_hz: esp_idf_hal::units::Hertz, d: &[u32]) -> VariableL
 pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) {
     if let Some(v) = persist.load_ac_state() {
         unpack(v);
+        if v >> 31 != 0 { HAVE_STATE.store(true, Ordering::Relaxed); }
     }
     LAST_SENT_ON.store(POWER.load(Ordering::Relaxed), Ordering::Relaxed);
     OFF_AT.store(persist.load_ac_off_at().unwrap_or(0), Ordering::Relaxed);
@@ -897,9 +985,10 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                     } else {
                         VERIFY_SENDS.store(1, Ordering::Relaxed);
                     }
-                    // WiFi first (the AC's own cloud link, confirmed by its report ~1 s later);
-                    // IR when there's no live link or a WiFi write wasn't confirmed (retry).
-                    if !retry && wifi_write() {
+                    // WiFi whenever the AC's link is up, retries included (2026-10-27: a retry over the weak
+                    // IR LED almost never lands -- a 28C request failed after 3 IR retries while WiFi was
+                    // up). IR only when there's no live link.
+                    if wifi_write() {
                         via_wifi = true;
                         PATH.store(PATH_WIFI, Ordering::Relaxed);
                         info!("[ac] main state sent over WiFi: {}", state_json_short());
@@ -918,7 +1007,14 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 // A main change that just went over WiFi isn't confirmed yet: extras wait for the next cycle.
                 let on = extras_ready && !via_wifi;
                 if on && PENDING_SWING_V.swap(false, Ordering::Relaxed) {
-                    frames.push(SWING_V[SWING_V_IDX.load(Ordering::Relaxed) as usize % SWING_V.len()].1);
+                    // Over WiFi first (rethink's 0x321 write, the AC reports it back); IR otherwise.
+                    let idx = SWING_V_IDX.load(Ordering::Relaxed) as usize % SWING_V.len();
+                    let tlv = match idx { 0 => 0, 1 => 100, i => i as u32 - 1 };
+                    if crate::ac_cloud::readback().is_some() && crate::ac_cloud::write_climate(&[(0x321, tlv)]) {
+                        info!("[ac] vertical airflow {} sent over WiFi", SWING_V[idx].0);
+                    } else {
+                        frames.push(SWING_V[idx].1);
+                    }
                 }
                 if on && PENDING_SWING_H.swap(false, Ordering::Relaxed) {
                     frames.push(SWING_H[SWING_H_IDX.load(Ordering::Relaxed) as usize % SWING_H.len()].1);
