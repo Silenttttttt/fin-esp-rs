@@ -157,17 +157,21 @@ static OFF_AT: AtomicU32 = AtomicU32::new(0);
 /// Fin-ESP's own IR receiver (GPIO32) sits cm from the LED and sees every frame we send. The
 /// NEC remote reader checks this and ignores the line while we transmit (+ a short tail), so
 /// our own AC frames never reach it as noise.
-static TX_BLANK_UNTIL_US: AtomicU32 = AtomicU32::new(0);
+static TX_BLANK_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 const TX_BLANK_TAIL_US: u32 = 150_000;
 
 pub fn tx_blanking() -> bool {
-    let now = unsafe { esp_idf_sys::esp_timer_get_time() } as u32;
-    (TX_BLANK_UNTIL_US.load(Ordering::Relaxed).wrapping_sub(now) as i32) > 0
+    // 2026-10-27 fix: this used `(until - now) as i32 > 0`. With a u32 microsecond clock that turns
+    // true for ~36 min once `now` is 2^31 us (35.8 min) past the last blank_for() -- so from ~36 min
+    // after boot the blue button was ignored for the next 36 min ("it doesnt do anything anymore").
+    // A real blanking window is never longer than a few seconds, so anything bigger is an expired one.
+    // Kept in ms (wraps every ~49.7 days, not every 71.6 min like the old us clock).
+    let left = TX_BLANK_UNTIL_MS.load(Ordering::Relaxed).wrapping_sub(now_ms());
+    left != 0 && left < 5_000
 }
 
 fn blank_for(us: u32) {
-    let now = unsafe { esp_idf_sys::esp_timer_get_time() } as u32;
-    TX_BLANK_UNTIL_US.store(now.wrapping_add(us), Ordering::Relaxed);
+    TX_BLANK_UNTIL_MS.store(now_ms().wrapping_add(us.div_ceil(1000)), Ordering::Relaxed);
 }
 
 fn now_ms() -> u32 {
@@ -273,9 +277,17 @@ fn mode_from_tlv(t: u32) -> Option<u8> {
 }
 /// TLV fan code for each FANS entry (same order: lowest, low, medium, high, max, auto).
 const FAN_TLV: [u32; 6] = [2, 3, 4, 5, 6, 8];
-/// Cool, heat and auto hold a user setpoint (auto confirmed live 2026-10-27: the AC reported
-/// 22 -> 25 in auto over WiFi); dry and fan-only ignore it.
-fn temp_applies(mode_idx: u8) -> bool { mode_idx == 0 || mode_idx == 3 || mode_idx == 4 }
+/// Only cool and heat hold a FIXED user setpoint. Auto was added here 2026-10-27 after observing
+/// the AC's own report move 22 -> 25 in auto over WiFi -- but that move was the AC's own "AI Auto"
+/// algorithm re-picking its target on its own (confirmed live 2026-10-28: a real LG Auto mode does
+/// NOT hold a fixed setpoint the way cool/heat do), not an external change worth tracking. Treating
+/// it as one meant closed_loop()'s background adopt() kept silently overwriting Fin-ESP's saved/
+/// persisted temp with whatever the AC's own algorithm had most recently drifted to -- so a later
+/// IR/web power toggle (which always preserves "the current saved temp") restored that drifted,
+/// AC-picked value instead of what the user actually last asked for ("turn off, turn back on, it's
+/// at some random 18-20C" -- the exact bug reported). Dry and fan-only were already excluded for the
+/// same reason the acPicks dashboard logic exists for them; auto now gets the same treatment there.
+fn temp_applies(mode_idx: u8) -> bool { mode_idx == 0 || mode_idx == 4 }
 
 /// Does the AC's report match Fin-ESP's power/mode/setpoint?
 fn matches(rb: &crate::ac_cloud::Readback) -> bool {
@@ -293,9 +305,16 @@ fn adopt(rb: &crate::ac_cloud::Readback, persist: &Persist) {
     POWER.store(rb.power, Ordering::Relaxed);
     LAST_SENT_ON.store(rb.power, Ordering::Relaxed);
     if let Some(m) = mode_from_tlv(rb.mode) { MODE.store(m, Ordering::Relaxed); }
-    if let Some(h) = rb.target_half {
-        let t = (h / 2) as u8;
-        if (TEMP_MIN..=TEMP_MAX).contains(&t) { TEMP.store(t, Ordering::Relaxed); }
+    // Same gate as matches()/temp_applies(): only cool/heat hold a fixed setpoint worth adopting.
+    // Unconditionally copying rb.target_half here (regardless of mode) was the actual bug behind
+    // "toggle off/on restores some random 18-20C" -- in dry/fan/auto the AC reports its OWN picked
+    // target, which used to get written into Fin-ESP's saved temp here any time adopt() ran for any
+    // other reason (a power/mode mismatch), not just when temp_applies() itself triggered it.
+    if temp_applies(MODE.load(Ordering::Relaxed)) {
+        if let Some(h) = rb.target_half {
+            let t = (h / 2) as u8;
+            if (TEMP_MIN..=TEMP_MAX).contains(&t) { TEMP.store(t, Ordering::Relaxed); }
+        }
     }
     if let Some(f) = rb.fan.and_then(|f| FAN_TLV.iter().position(|x| *x == f)) { FAN.store(f as u8, Ordering::Relaxed); }
     if !rb.power && OFF_AT.load(Ordering::Relaxed) != 0 { sleep_in(0); }
@@ -326,6 +345,12 @@ fn closed_loop(persist: &Persist) {
         let seen = AC_SEEN.swap(if r.power { SEEN_ON } else { SEEN_OFF }, Ordering::Relaxed);
         if r.power && seen == SEEN_OFF {
             REASSERT_AT_MS.store(now.wrapping_add(REASSERT_DELAY_MS).max(1), Ordering::Relaxed);
+        }
+        // Entered cooling: put the saved max power back (the AC drops it outside cooling).
+        let was_cool = AC_COOLING.swap(r.power && r.mode == 0, Ordering::Relaxed);
+        if r.power && r.mode == 0 && !was_cool && POWER_LIMIT.load(Ordering::Relaxed) != 0 {
+            PENDING_POWER_LIMIT.store(true, Ordering::Relaxed);
+            touch();
         }
         let at = REASSERT_AT_MS.load(Ordering::Relaxed);
         if at != 0 && r.power && VERIFY.load(Ordering::Relaxed) != V_WAITING && now.wrapping_sub(at) < u32::MAX / 2 {
@@ -383,6 +408,8 @@ const SEEN_OFF: u8 = 1;
 const SEEN_ON: u8 = 2;
 /// The AC's power as last seen in its own report.
 static AC_SEEN: AtomicU8 = AtomicU8::new(SEEN_UNKNOWN);
+/// The AC was on and cooling at the last report (max power only applies then).
+static AC_COOLING: AtomicBool = AtomicBool::new(false);
 /// When to re-apply saved settings after the AC came on (0 = nothing scheduled).
 static REASSERT_AT_MS: AtomicU32 = AtomicU32::new(0);
 /// Gives the AC time to report its post-power-on airflow/settings before comparing.
@@ -422,7 +449,7 @@ fn restore_extras(rb: &crate::ac_cloud::Readback, what: &mut String) {
     if sh.is_some_and(|i| i != SWING_H_IDX.load(Ordering::Relaxed)) { PENDING_SWING_H.store(true, Ordering::Relaxed); what.push_str(" swing_h"); }
     let ad = match rb.auto_dry { Some(0) => Some(false), Some(255) => Some(true), _ => None };
     if ad.is_some_and(|v| v != AUTO_CLEAN.load(Ordering::Relaxed)) { PENDING_AUTO_CLEAN.store(true, Ordering::Relaxed); what.push_str(" auto_clean"); }
-    let pl = rb.power_limit.map(|p| if p == 0 { 100 } else { p as u8 }).and_then(|p| POWER_LIMITS.iter().position(|(x, _)| *x == p));
+    let pl = rb.power_limit.filter(|_| rb.mode == 0).map(|p| if p == 0 { 100 } else { p as u8 }).and_then(|p| POWER_LIMITS.iter().position(|(x, _)| *x == p));
     if pl.is_some_and(|i| i as u8 != POWER_LIMIT.load(Ordering::Relaxed)) { PENDING_POWER_LIMIT.store(true, Ordering::Relaxed); what.push_str(" power_limit"); }
     if ENERGY_SAVING.load(Ordering::Relaxed) { PENDING_ENERGY_SAVING.store(true, Ordering::Relaxed); what.push_str(" energy_saving"); }
 }
@@ -445,7 +472,11 @@ fn adopt_extras(rb: &crate::ac_cloud::Readback, persist: &Persist) {
     if !PENDING_AUTO_CLEAN.load(Ordering::Relaxed) {
         match rb.auto_dry { Some(0) => AUTO_CLEAN.store(false, Ordering::Relaxed), Some(255) => AUTO_CLEAN.store(true, Ordering::Relaxed), _ => {} }
     }
-    if !PENDING_POWER_LIMIT.load(Ordering::Relaxed) {
+    // Max power (LG Energy Control) only exists in cooling: in any other mode the AC reports 0 (full)
+    // regardless, so only a cooling report can say what it really is (rethink: "re-applied whenever
+    // the AC is back in Cooling"). 2026-10-27, Muni: "max power doesnt persist" -- it was being
+    // overwritten by the auto-mode 0.
+    if !PENDING_POWER_LIMIT.load(Ordering::Relaxed) && rb.mode == 0 {
         let pct = match rb.power_limit { Some(0) => Some(100u8), Some(p) => Some(p as u8), None => None };
         if let Some(i) = pct.and_then(|p| POWER_LIMITS.iter().position(|(x, _)| *x == p)) { POWER_LIMIT.store(i as u8, Ordering::Relaxed); }
     }
@@ -791,7 +822,10 @@ pub fn listen(secs: u32) {
 }
 
 pub fn sniffed() -> String {
-    let listening = (LISTEN_UNTIL_MS.load(Ordering::Relaxed).wrapping_sub(now_ms()) as i32) > 0;
+    // Same wraparound guard as tx_blanking(): `as i32 > 0` would read an expired window as active
+    // once the u32 ms clock is 2^31 ms (~24.8 days) past it. Listen windows are at most minutes.
+    let left = LISTEN_UNTIL_MS.load(Ordering::Relaxed).wrapping_sub(now_ms());
+    let listening = left != 0 && left < 3_600_000;
     let mut out = std::format!("listening={listening}\n");
     if let Ok(v) = SNIFFED.lock() { for (i, f) in v.iter().enumerate() { out.push_str(&std::format!("{} {f}\n", i + 1)); } }
     out
@@ -1006,12 +1040,14 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                 }
                 // A main change that just went over WiFi isn't confirmed yet: extras wait for the next cycle.
                 let on = extras_ready && !via_wifi;
+                let mut wifi_extra_sent = false;
                 if on && PENDING_SWING_V.swap(false, Ordering::Relaxed) {
                     // Over WiFi first (rethink's 0x321 write, the AC reports it back); IR otherwise.
                     let idx = SWING_V_IDX.load(Ordering::Relaxed) as usize % SWING_V.len();
                     let tlv = match idx { 0 => 0, 1 => 100, i => i as u32 - 1 };
                     if crate::ac_cloud::readback().is_some() && crate::ac_cloud::write_climate(&[(0x321, tlv)]) {
                         info!("[ac] vertical airflow {} sent over WiFi", SWING_V[idx].0);
+                        wifi_extra_sent = true;
                     } else {
                         frames.push(SWING_V[idx].1);
                     }
@@ -1027,7 +1063,16 @@ pub fn spawn(channel: CHANNEL0<'static>, pin: Gpio2<'static>, persist: Persist) 
                     frames.push(ENERGY_SAVING_CODES[ENERGY_SAVING.load(Ordering::Relaxed) as usize]);
                 }
                 if on && PENDING_POWER_LIMIT.swap(false, Ordering::Relaxed) {
-                    frames.push(POWER_LIMITS[POWER_LIMIT.load(Ordering::Relaxed) as usize % POWER_LIMITS.len()].1);
+                    let (pct, ir) = POWER_LIMITS[POWER_LIMIT.load(Ordering::Relaxed) as usize % POWER_LIMITS.len()];
+                    match crate::ac_cloud::readback() {
+                        // Not cooling: nothing to send now, the choice stays saved and goes out on entering cool.
+                        Some(rb) if rb.mode != 0 => info!("[ac] max power {pct}% saved; applies once the AC is cooling"),
+                        Some(_) if !wifi_extra_sent && crate::ac_cloud::write_climate(&[(0x20d, if pct == 100 { 0 } else { pct as u32 })]) => {
+                            info!("[ac] max power {pct}% sent over WiFi");
+                        }
+                        Some(_) => PENDING_POWER_LIMIT.store(true, Ordering::Relaxed), // one WiFi write per cycle: next cycle
+                        None => frames.push(ir),
+                    }
                 }
                 if on && PENDING_SHOW_POWER.swap(false, Ordering::Relaxed) {
                     frames.push(LG_SHOW_POWER);

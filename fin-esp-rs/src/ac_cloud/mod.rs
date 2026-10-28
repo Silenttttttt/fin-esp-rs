@@ -633,6 +633,7 @@ pub fn write_climate(elems: &[(u16, u32)]) -> bool {
             0x1fa => matches!(v, 2..=6 | 8),
             0x1fe => (32..=60).contains(&v),
             0x321 => matches!(v, 0..=6 | 100), // vertical vane: fixed, 1-6 top..bottom, swing
+            0x20d => matches!(v, 0 | 40 | 60 | 80), // energy control (max power) %, 0 = full; cooling only
             _ => false,
         };
         if !ok { warn!("[ac_cloud] refused climate write {t:#x}={v}"); return false; }
@@ -720,7 +721,7 @@ pub fn status_json() -> String {
                 "\"deploys\":{dep},\"device_ready\":{dr},\"caps\":{caps},\"values\":{vals},\"frames\":{fr},\"crc_bad\":{cb},\"private\":{fp},\"unknown\":{fu},",
                 "\"last_frame_s_ago\":{lf},\"queries\":{qu},\"timesyncs\":{ts},\"timesync_skipped\":{tss},\"bad_json\":{bj},\"other_cmds\":{oc},\"prov_acks\":{pa}}},",
                 "\"ac\":{{\"power\":{pw},\"mode\":{md},\"fan\":{fan},\"room_c\":{rc},\"target_c\":{tc},\"outdoor_c\":{oc2},\"odu_coil_c\":{coil},",
-                "\"compressor_hz\":{hz},\"eev\":{eev},\"fan_rpm_raw\":{rpm},\"error\":{err}}},",
+                "\"compressor_hz\":{hz},\"odu_hz\":{ohz},\"eev\":{eev},\"fan_rpm_raw\":{rpm},\"fan_rpm\":{frpm},\"power_w\":{pww},\"amps\":{amps},\"volts\":{volts},\"idu_coil_c\":{icoil},\"autodry_pct\":{adp},\"error\":{err}}},",
                 "\"regs\":{{{regs}}},",
                 "\"last_err\":\"{le}\",\"stack_hwm\":{hwm},\"pressure_drops\":{pd},\"heap\":{{\"free\":{hfree},\"largest\":{hlarge}}}}}"
             ),
@@ -744,6 +745,21 @@ pub fn status_json() -> String {
             rc = half(r.get(0x1fd)), tc = half(r.get(0x1fe)),
             oc2 = tbl(&tlv::RAC_AIR_TEMP, r.get(0x332)), coil = tbl(&tlv::RAC_PIPE_TEMP, r.get(0x32c)),
             hz = opt(r.get(0x22a)), eev = opt(r.get(0x330)), rpm = opt(r.get(0x331)), err = opt(r.get(0x221)),
+            // rethink RAC_056905_WW: 0x32f outdoor compressor Hz (0x22a is capped at 15); 0x331 is fan RPM / 10;
+            // 0x2b3 is momentary power when 0x2d5 has a MOMENTARY bit (W = max(5, raw - 60) for the
+            // in+outdoor variant, raw as-is for outdoor-only); 0x225 = auto-dry drying left, %.
+            ohz = opt(r.get(0x32f)), frpm = opt(r.get(0x331).map(|v| v * 10)),
+            pww = opt(match (r.get(0x2d5), r.get(0x2b3)) {
+                (Some(m), Some(v)) if m & 0x4 != 0 => Some(v),
+                (Some(m), Some(v)) if m & 0x2 != 0 => Some(v.saturating_sub(60).max(5)),
+                _ => None,
+            }),
+            adp = opt(r.get(0x225)),
+            // regdecode/FINDINGS.md (rethink #167, confirmed live): 0x228 input current x10 A,
+            // 0x229 mains voltage - 140 V, 0x32b indoor heat-exchanger temp (pipe table; raw 0/1 = invalid).
+            amps = r.get(0x228).map(|v| format!("{:.1}", v as f32 / 10.0)).unwrap_or_else(|| "null".into()),
+            volts = opt(r.get(0x229).map(|v| v + 140)),
+            icoil = tbl(&tlv::RAC_PIPE_TEMP, r.get(0x32b).filter(|v| *v > 1)),
             regs = regs,
             le = json_escape(&st.last_err), hwm = st.stack_hwm, pd = st.pressure_drops,
             hfree = heap_free(), hlarge = heap_largest(),

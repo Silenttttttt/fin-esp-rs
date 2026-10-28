@@ -179,6 +179,8 @@ button:active{opacity:.72;transform:scale(.96)}
 .ac-pwr .ac-pi{font-size:1.05rem;line-height:1}
 .ac-pwr.on{background:var(--up);color:#05210f;border-color:#4ade80;box-shadow:0 0 18px rgba(34,197,94,.55)}
 .card.cold{border-color:rgba(34,197,94,.45)}
+.card.acpicks .ac-temp .ac-tbtn{opacity:.35}
+.ac-plnote{font-size:.68rem;color:var(--dim);align-self:center;margin-left:.3rem}
 .card.acoff .ac-t{color:var(--dim);font-size:2.3rem;letter-spacing:.06em}
 .card.acoff .ac-scenes,.card.acoff .ac-auto,.card.acoff .ac-temp .ac-tbtn{opacity:.5}
 .ac-note{font-size:.68rem;color:var(--dim);margin-top:.6rem;text-align:center}
@@ -280,7 +282,7 @@ button:active{opacity:.72;transform:scale(.96)}
       <button id="acpl-100" onclick="acPost('/action/ac/feature?power_limit=100')">full</button>
       <button id="acpl-80" onclick="acPost('/action/ac/feature?power_limit=80')">80%</button>
       <button id="acpl-60" onclick="acPost('/action/ac/feature?power_limit=60')">60%</button>
-      <button id="acpl-40" onclick="acPost('/action/ac/feature?power_limit=40')">40%</button></div></div>
+      <button id="acpl-40" onclick="acPost('/action/ac/feature?power_limit=40')">40%</button><span class="ac-plnote" id="acplnote"></span></div></div>
     <div class="ac-xbtns">
       <button onclick="acPost('/action/ac/show_power')">&#9889; Show power on AC</button>
       <button onclick="acPost('/action/ac/resend')">&#8635; Re-send to AC</button>
@@ -486,9 +488,14 @@ function acLive(){
       row('Room',d.room_c!=null?d.room_c+'\u00B0':'')+
       row('Outside',d.outdoor_c!=null?d.outdoor_c+'\u00B0':'')+
       row('Coil',d.odu_coil_c!=null?d.odu_coil_c+'\u00B0':'')+
-      row('Compressor',d.compressor_hz?d.compressor_hz+'Hz':(d.power?'running':'idle'))+
+      row('Indoor coil',d.idu_coil_c!=null?d.idu_coil_c+'\u00B0':'')+
+      row('Compressor',(d.odu_hz||d.compressor_hz)?(d.odu_hz||d.compressor_hz)+' Hz':(d.power?'idle':'off'))+
+      row('Power',d.power_w!=null?(d.power_w>=1000?(d.power_w/1000).toFixed(2)+' kW':d.power_w+' W')+(d.amps&&d.amps!=='0.0'?' \u00B7 '+d.amps+' A':''):'')+
+      row('Mains',d.volts!=null?d.volts+' V':'')+
+      row('Fan',d.fan_rpm!=null?d.fan_rpm+' rpm':'')+
       row('EEV',d.eev)+
-      row('Err',d.error&&d.error!=='0'&&d.error!==0?d.error:'');
+      row('Drying',d.autodry_pct?d.autodry_pct+'% left':'')+
+      row('Error',d.error&&d.error!=='0'&&d.error!==0?'CH'+('0'+d.error).slice(-2):'');
     el.className='ac-live on';
   }).catch(function(){document.getElementById('aclive').className='ac-live';});
 }
@@ -504,10 +511,18 @@ function acPills(){
 function acUpd(a){
   if(!a)return;
   acOn=a.on;
-  document.getElementById('accard').className='card'+(a.on?' cold':' acoff');
+  document.getElementById('acplnote').textContent=(a.power_limit!==100&&a.mode!=='cool')?'applies in Cool only':'';
+  // Dry, fan-only and auto ignore the user setpoint: the AC picks its own (dry measured 23.5 with 25
+  // saved; auto's own "AI" re-targets on its own, confirmed live 2026-10-28 drifting 22->18-20C over
+  // time) -- show the AC's real target there instead of Fin-ESP's saved one, which now only tracks
+  // what was actually asked for in cool/heat (ac.rs temp_applies, fixed 2026-10-28: auto used to be
+  // treated as setpoint-holding, so the background sync kept overwriting the saved temp with whatever
+  // auto had drifted to -- a power toggle would then "restore" that drifted value, looking random).
+  var acPicks=a.on&&(a.mode==='dry'||a.mode==='fan'||a.mode==='auto')&&a.real&&a.real.temp!=null;
+  document.getElementById('accard').className='card'+(a.on?' cold':' acoff')+(acPicks?' acpicks':'');
   document.getElementById('acst').textContent=a.on?'ON':'OFF';document.getElementById('acpwr').className='ac-pwr'+(a.on?' on':'');
-  document.getElementById('act').textContent=a.on?a.temp+'\u00B0':'OFF';
-  document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode):'set to '+a.temp+'\u00B0';
+  document.getElementById('act').textContent=a.on?(acPicks?a.real.temp:a.temp)+'\u00B0':'OFF';
+  document.getElementById('acmodelbl').textContent=a.on?(ACL.mode[a.mode]||a.mode)+(acPicks?' \u00B7 temp set by AC':''):'set to '+a.temp+'\u00B0';
   var cur={mode:a.mode,fan:a.fan,sv:a.swing_v,sh:a.swing_h};
   Object.keys(AC).forEach(function(k){AC[k].forEach(function(v){
     document.getElementById('ac'+k+'-'+v).className=(cur[k]===v)?'act':'';});});

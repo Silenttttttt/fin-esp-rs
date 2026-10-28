@@ -240,7 +240,17 @@ fn dispatch(command: u8, lamp_handle: &LampHandle, play_pause_ready: &'static st
             info!("[ir] 0 -> media play/pause");
         }
         0x07 => {
-            // 7 -- AC on/off, same as the blue button (toggles the AC's real power)
+            // 7 -- AC on/off, same as the blue button (toggles the AC's real power). Same 1.5 s
+            // lockout as the blue button: one press decoded twice 26 ms apart (22:53:48) toggled the
+            // AC on and straight back off.
+            static LAST_7_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let now = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1000) as u32;
+            let last = LAST_7_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if last != 0 && now.wrapping_sub(last) < crate::config::AC_BTN_LOCKOUT_MS as u32 {
+                info!("[ir] 7 ignored ({} ms after the last one)", now.wrapping_sub(last));
+                return;
+            }
+            LAST_7_MS.store(now, std::sync::atomic::Ordering::Relaxed);
             let on = crate::ac::button_toggle();
             info!("[ir] 7 -> AC {}", if on { "on" } else { "off" });
             crate::api::report_event("button_press", "info", std::format!("AC {} (IR remote 7)", if on { "on" } else { "off" }), "ir_remote");
